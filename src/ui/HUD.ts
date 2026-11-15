@@ -118,7 +118,8 @@ export class HUD {
               <div><span class="kbd">E</span> Interact <span class="kbd">R</span> Reload</div>
               <div><span class="kbd">1-6</span>/<span class="kbd">Wheel</span> Weapons</div>
               <div><span class="kbd">Tab</span> Pack <span class="kbd">Q</span> Heal</div>
-              <div><span class="kbd">C</span> Crouch <span class="kbd">F</span> Light <span class="kbd">Esc</span> Pause</div>
+              <div><span class="kbd">C</span> Crouch <span class="kbd">F</span> Light <span class="kbd">V</span> Shoulder</div>
+              <div><span class="kbd">Mouse</span> Orbit camera <span class="kbd">Esc</span> Pause</div>
             </div>
 
             <button id="btn-deploy" class="w-full py-3.5 rounded-xl bg-red-600 hover:bg-red-500 active:scale-[0.99] text-white font-bold tracking-[0.15em] uppercase transition shadow-lg shadow-red-900/50">

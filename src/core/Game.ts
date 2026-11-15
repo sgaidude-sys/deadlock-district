@@ -170,6 +170,10 @@ export class Game {
     this.scene.add(this.sunLight.target);
 
     this.physicsWorld = new CANNON.World({ gravity: new CANNON.Vec3(0, -18, 0) });
+    // Every body is pinned to the ground each frame, so ground friction only ever acted as a
+    // brake (it stalled slow-walking zombies and made the player ~20% slower). Turn it off;
+    // walls still block, and bodies now slide along them instead of sticking.
+    this.physicsWorld.defaultContactMaterial.friction = 0;
 
     this.audio = new AudioManager(this.assets);
     this.audio.attachToCamera(this.camera);
@@ -286,7 +290,7 @@ export class Game {
     });
 
     // Warm the shader cache so the first frame of gameplay doesn't hitch
-    this.renderer.compile(this.scene, this.camera);
+    this.precompile();
     this.ready = true;
     this.hud.showReady();
     this.animate();
@@ -306,7 +310,7 @@ export class Game {
       this.input,
       this.vfx
     );
-    this.player.yaw = -0.7; // face the central intersection
+    this.player.setYaw(-0.7); // face the central intersection
     this.player.setCameraOccluders(this.worldData.cameraOccluders);
 
     this.zombieManager = new ZombieManager(
@@ -347,10 +351,49 @@ export class Game {
       return true;
     });
 
+    this.warmUpShaders();
     this.audio.startMusic();
     this.input.requestPointerLock();
     this.running = true;
     this.showToast('Find 3 Jerrycans + the Radio Beacon. Gunfire attracts the dead.', 5);
+  }
+
+  /**
+   * Compile every shader the game will need *now* (behind the deploy click) instead of
+   * mid-fight: the player, flashlight, zombies and first muzzle flash / blood / sparks each
+   * introduce new programs, which otherwise compile on first use and freeze the game.
+   */
+  private warmUpShaders(): void {
+    const hidden = new THREE.Vector3(0, -50, 0);
+    const up = new THREE.Vector3(0, 1, 0);
+    this.vfx.spawnMuzzleFlash(hidden, up, true);
+    this.vfx.spawnTracer(hidden, hidden.clone().add(up));
+    this.vfx.spawnBloodBurst(hidden, up, 2);
+    this.vfx.spawnImpactSparks(hidden, up);
+    this.vfx.spawnBloodDecal(hidden);
+    // Every zombie rig, including ones not in the starting population (brutes appear later)
+    const standIns = ['zombie_basic', 'zombie_arm', 'zombie_ribcage', 'zombie_chubby'].map((k) => {
+      const m = this.assets.cloneModel(k);
+      m.position.copy(hidden);
+      this.scene.add(m);
+      return m;
+    });
+    this.player?.group.updateMatrixWorld(true);
+    this.precompile();
+    standIns.forEach((m) => this.scene.remove(m));
+  }
+
+  /**
+   * Compile shaders exactly as the game renders them: into the post-processing chain's linear
+   * render target (a different shader variant from direct-to-screen output), then draw one real
+   * frame so shadow-depth variants are built too.
+   */
+  private precompile(): void {
+    const prev = this.renderer.getRenderTarget();
+    this.renderer.setRenderTarget(this.composer.readBuffer);
+    this.renderer.compile(this.scene, this.camera);
+    this.renderer.setRenderTarget(prev);
+    this.composer.render();
   }
 
   private registerHit(kind: 'hit' | 'head' | 'kill'): void {
@@ -380,6 +423,7 @@ export class Game {
   private bindHotkeys(): void {
     const active = () => this.running && !this.inventoryOpen && !this.paused && !this.gameOver;
     this.input.onKeyPress('KeyF', () => active() && this.player?.toggleFlashlight());
+    this.input.onKeyPress('KeyV', () => active() && this.player?.swapShoulder());
     this.input.onKeyPress('KeyC', () => active() && this.player?.toggleCrouch());
     this.input.onKeyPress('KeyR', () => active() && this.player?.startReload());
     this.input.onKeyPress('KeyQ', () => {
@@ -751,7 +795,7 @@ export class Game {
       return;
     }
 
-    this.dog?.update(dt, pPos, this.player.yaw, this.zombieManager);
+    this.dog?.update(dt, pPos, this.player.facing, this.zombieManager);
     this.dayNight.update(dt, this.elapsed, pPos, this.camera.position);
     this.vfx.update(dt, this.elapsed, pPos);
 

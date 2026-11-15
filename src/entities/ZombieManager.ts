@@ -54,64 +54,75 @@ const HITBOX_MAT = new THREE.MeshBasicMaterial({ visible: false });
 type AnimRole = 'idle' | 'walk' | 'run' | 'attack' | 'hit' | 'death';
 
 interface ArchetypeSpec {
-  model: string;
+  /** Kit model keys; one is picked at random per spawn. */
+  models: string[];
   hp: number;
+  /** Chase speed (m/s). Patrol is 40 % of this. */
   speed: number;
   damage: number;
   radius: number;
   scale: number;
   /** Native standing height of the kit model (metres). */
   height: number;
-  /** Ground speed (m/s) at which the move clip looks right at timeScale 1. */
-  moveClipSpeed: number;
+  /** Ground speed (m/s) each loop clip covers at timeScale 1 (measured from the kit's foot travel). */
+  clipSpeed: { walk: number; run: number };
   clips: Record<AnimRole, string>;
 }
 
-/** All four zombie types are Zombie Apocalypse Kit rigs with their own clips. */
+const CLIP_FALLBACKS: Record<AnimRole, string[]> = {
+  idle: ['Idle'],
+  walk: ['Walk'],
+  run: ['Run_Arms', 'Run', 'Walk'],
+  attack: ['Punch', 'Run_Attack', 'Idle_Attack', 'Jump'],
+  hit: ['HitReact'],
+  death: ['Death'],
+};
+
+/** All zombie types are Zombie Apocalypse Kit rigs with their own clips. */
 const ARCHETYPES: Record<ZombieArchetype, ArchetypeSpec> = {
   shambler: {
-    model: 'zombie_basic',
+    models: ['zombie_basic'],
     hp: 85,
-    speed: 1.9,
+    speed: 2.2,
     damage: 12,
     radius: 0.38,
     scale: 1.1,
     height: 1.25,
-    moveClipSpeed: 1.2,
-    clips: { idle: 'Idle', walk: 'Walk', run: 'Walk', attack: 'Punch', hit: 'HitReact', death: 'Death' },
+    clipSpeed: { walk: 0.8, run: 2.1 },
+    clips: { idle: 'Idle', walk: 'Walk', run: 'Run_Arms', attack: 'Punch', hit: 'HitReact', death: 'Death' },
   },
   sprinter: {
-    model: 'zombie_arm',
+    models: ['zombie_arm', 'zombie_ribcage'],
     hp: 60,
-    speed: 4.6,
+    speed: 4.0,
     damage: 14,
-    radius: 0.38,
-    scale: 1.05,
-    height: 1.45,
-    moveClipSpeed: 3.8,
-    clips: { idle: 'Idle', walk: 'Walk', run: 'Run_Arms', attack: 'Run_Attack', hit: 'HitReact', death: 'Death' },
+    radius: 0.36,
+    scale: 1.1,
+    height: 1.4,
+    clipSpeed: { walk: 0.8, run: 2.0 },
+    clips: { idle: 'Idle', walk: 'Walk', run: 'Run', attack: 'Punch', hit: 'HitReact', death: 'Death' },
   },
   brute: {
-    model: 'zombie_chubby',
+    models: ['zombie_chubby'],
     hp: 260,
     speed: 1.7,
     damage: 26,
     radius: 0.55,
     scale: 1.25,
     height: 1.55,
-    moveClipSpeed: 1.2,
+    clipSpeed: { walk: 0.8, run: 0.8 },
     clips: { idle: 'Idle', walk: 'Walk', run: 'Walk', attack: 'Punch', hit: 'HitReact', death: 'Death' },
   },
   crawler: {
-    model: 'zombie_ribcage',
-    hp: 50,
-    speed: 2.4,
+    models: ['zombie_basic'],
+    hp: 55,
+    speed: 1.1,
     damage: 10,
-    radius: 0.32,
-    scale: 1.2,
+    radius: 0.36,
+    scale: 1.1,
     height: 0.6,
-    moveClipSpeed: 1.0,
-    clips: { idle: 'Idle', walk: 'Crawl', run: 'Crawl', attack: 'Jump', hit: 'HitReact', death: 'Death' },
+    clipSpeed: { walk: 0.3, run: 0.3 },
+    clips: { idle: 'Crawl', walk: 'Crawl', run: 'Crawl', attack: 'Idle_Attack', hit: 'HitReact', death: 'Death' },
   },
 };
 
@@ -192,7 +203,7 @@ export class ZombieManager {
     this.idCounter++;
     const id = `zombie_${this.idCounter}`;
     const spec = ARCHETYPES[archetype];
-    const modelKey = spec.model;
+    const modelKey = spec.models[Math.floor(Math.random() * spec.models.length)];
     const { hp, speed, damage, radius, scale: scaleMod } = spec;
 
     const group = this.assets.cloneModel(modelKey);
@@ -241,7 +252,9 @@ export class ZombieManager {
     if (clips.length > 0) {
       mixer = new THREE.AnimationMixer(group);
       for (const [role, clipName] of Object.entries(spec.clips)) {
-        const clip = clips.find((c) => c.name === clipName);
+        // Not every kit rig has every clip (the skeleton has no Punch), so fall back sensibly
+        const candidates = [clipName, ...CLIP_FALLBACKS[role as AnimRole]];
+        const clip = candidates.map((n) => clips.find((c) => c.name === n)).find(Boolean);
         if (clip) actions[role] = mixer.clipAction(clip);
       }
     }
@@ -293,11 +306,18 @@ export class ZombieManager {
     return chasing ? 'run' : 'walk';
   }
 
+  /** Last known player position, so idle wandering drifts toward where the action is. */
+  private playerHint = new THREE.Vector3();
+
   private randomPatrolNear(pos: THREE.Vector3): THREE.Vector3 {
+    // A third of patrol legs head toward the player's neighbourhood; otherwise they mill about.
+    const towardPlayer = Math.random() < 0.35 && this.playerHint.lengthSq() > 0;
+    const base = towardPlayer ? this.playerHint : pos;
+    const spread = towardPlayer ? 24 : 18;
     return new THREE.Vector3(
-      THREE.MathUtils.clamp(pos.x + (Math.random() - 0.5) * 18, -62, 62),
+      THREE.MathUtils.clamp(base.x + (Math.random() - 0.5) * spread, -62, 62),
       0,
-      THREE.MathUtils.clamp(pos.z + (Math.random() - 0.5) * 18, -62, 62)
+      THREE.MathUtils.clamp(base.z + (Math.random() - 0.5) * spread, -62, 62)
     );
   }
 
@@ -455,6 +475,7 @@ export class ZombieManager {
     extractionActive: boolean,
     onPlayerHit: (damage: number, from: THREE.Vector3) => void
   ): void {
+    this.playerHint.copy(playerPos);
     // Horde Director spawning
     const alive = this.aliveCount();
     const maxZombies = extractionActive ? 34 : isNight ? 26 : 16;
@@ -651,8 +672,10 @@ export class ZombieManager {
       }
       const chasing = z.state === 'chase';
       const anim = this.moveAnim(z, chasing);
-      const base = ARCHETYPES[z.archetype].moveClipSpeed;
-      this.playZombieAnim(z, anim, THREE.MathUtils.clamp(moveSpeed / base, 0.5, 1.8));
+      const spec = ARCHETYPES[z.archetype];
+      const base = (anim === 'run' ? spec.clipSpeed.run : spec.clipSpeed.walk) * z.group.scale.x;
+      const actualSpeed = Math.hypot(z.body.velocity.x, z.body.velocity.z);
+      this.playZombieAnim(z, anim, THREE.MathUtils.clamp(actualSpeed / base, 0.35, 3.2));
       this.syncTransform(z, dt);
     }
   }
@@ -673,7 +696,7 @@ export class ZombieManager {
   private syncTransform(z: ZombieInstance, _dt: number): void {
     z.body.position.y = z.radius;
     z.body.velocity.y = 0;
-    z.group.position.set(z.body.position.x, 0.03, z.body.position.z);
+    z.group.position.set(z.body.position.x, 0.06, z.body.position.z);
     z.group.rotation.set(0, z.facing, 0);
   }
 }
