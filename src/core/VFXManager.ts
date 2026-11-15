@@ -410,9 +410,9 @@ export class VFXManager {
     const keys = ['prop_blood1', 'prop_blood2', 'prop_blood3'].filter((k) => this.assets.hasModel(k));
     if (keys.length === 0) return;
     const decal = this.assets.cloneModel(keys[Math.floor(Math.random() * keys.length)]);
-    decal.position.set(pos.x, 0.035, pos.z);
+    decal.position.set(pos.x, 0.07, pos.z);
     decal.rotation.y = Math.random() * Math.PI * 2;
-    decal.scale.setScalar(0.9 + Math.random() * 0.6);
+    decal.scale.setScalar(0.45 + Math.random() * 0.35);
     decal.traverse((o) => {
       o.castShadow = false;
       o.receiveShadow = true;

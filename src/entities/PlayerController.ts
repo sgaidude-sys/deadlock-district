@@ -33,8 +33,10 @@ const BAKED_WEAPON: Record<WeaponId, { node: string; muzzle: number; scale: numb
 };
 const ALL_BAKED = ['Axe', 'Guitar', 'Knife', 'Pistol', 'Rifle', 'Shotgun', 'SMG', 'Spear', 'WoodenBat_Barbed', 'WoodenBat_Saw'];
 
-const STAND_HEIGHT = 1.68;
-const CROUCH_HEIGHT = 1.25;
+// Kit survivors are ~1.4 m tall at native scale
+const STAND_HEIGHT = 1.3;
+const CROUCH_HEIGHT = 0.95;
+const BODY_RADIUS = 0.38;
 
 export class PlayerController {
   public group = new THREE.Group();
@@ -109,7 +111,7 @@ export class PlayerController {
   // Camera smoothing
   private currentCamPos = new THREE.Vector3();
   private currentLookAt = new THREE.Vector3();
-  private camDistance = 4.2;
+  private camDistance = 3.6;
   private eyeHeight = STAND_HEIGHT;
 
   constructor(
@@ -132,8 +134,8 @@ export class PlayerController {
 
     this.body = new CANNON.Body({
       mass: 75,
-      shape: new CANNON.Sphere(0.45),
-      position: new CANNON.Vec3(spawnPos.x, 0.45, spawnPos.z),
+      shape: new CANNON.Sphere(BODY_RADIUS),
+      position: new CANNON.Vec3(spawnPos.x, BODY_RADIUS, spawnPos.z),
       linearDamping: 0.9,
       fixedRotation: true,
     });
@@ -171,7 +173,7 @@ export class PlayerController {
     this.flashlight.castShadow = true;
     this.flashlight.shadow.mapSize.set(512, 512);
     this.flashlight.shadow.bias = -0.002;
-    this.flashlight.position.set(-0.22, 1.4, 0.35);
+    this.flashlight.position.set(-0.2, 1.05, 0.3);
     this.group.add(this.flashlight);
     this.group.add(this.flashlightTarget);
     this.flashlightTarget.position.set(0, 1.2, 10);
@@ -182,8 +184,8 @@ export class PlayerController {
     this.group.add(this.volumetricCone);
 
     this.equipWeapon('pistol', true);
-    this.currentCamPos.copy(spawnPos).add(new THREE.Vector3(0.72, 2.0, 4.2));
-    this.currentLookAt.copy(spawnPos).add(new THREE.Vector3(0.36, 1.5, -6));
+    this.currentCamPos.copy(spawnPos).add(new THREE.Vector3(0.6, 1.7, 3.6));
+    this.currentLookAt.copy(spawnPos).add(new THREE.Vector3(0.3, 1.2, -6));
   }
 
   public setOnShotHit(cb: ShotHitCallback): void {
@@ -415,15 +417,15 @@ export class PlayerController {
     }
 
     // Keep player grounded
-    this.body.position.y = 0.45;
+    this.body.position.y = BODY_RADIUS;
     this.body.velocity.y = 0;
 
-    this.group.position.set(this.body.position.x, 0.03, this.body.position.z);
+    this.group.position.set(this.body.position.x, 0.06, this.body.position.z);
     this.group.rotation.y = this.yaw + Math.PI;
 
     // Flashlight follows aim pitch
     const aimOffset = Math.sin(this.pitch) * 10;
-    this.flashlightTarget.position.set(0, 1.25 + aimOffset, 10);
+    this.flashlightTarget.position.set(0, 0.9 + aimOffset, 10);
     this.volumetricCone.rotation.x = -this.pitch;
 
     // Delayed melee impact lines up with the swing animation
@@ -461,7 +463,7 @@ export class PlayerController {
       this.activeWeaponNode.getWorldPosition(pos);
       pos.addScaledVector(aimDir, BAKED_WEAPON[this.equippedWeapon.id].muzzle);
     } else {
-      pos.copy(this.getPosition()).add(new THREE.Vector3(0, 1.3, 0)).addScaledVector(aimDir, 0.6);
+      pos.copy(this.getPosition()).add(new THREE.Vector3(0, 1.0, 0)).addScaledVector(aimDir, 0.5);
     }
     return pos;
   }
@@ -554,8 +556,8 @@ export class PlayerController {
 
   private updateCamera(dt: number): void {
     const pos = this.getPosition();
-    const targetDist = this.isAiming ? 2.3 : this.isSprinting ? 4.6 : 4.2;
-    const shoulderOffset = this.isAiming ? 0.8 : 0.7;
+    const targetDist = this.isAiming ? 2.0 : this.isSprinting ? 4.0 : 3.6;
+    const shoulderOffset = this.isAiming ? 0.7 : 0.6;
     this.eyeHeight = THREE.MathUtils.lerp(this.eyeHeight, this.isCrouching ? CROUCH_HEIGHT : STAND_HEIGHT, Math.min(1, dt * 10));
 
     const forward = this.getForward();

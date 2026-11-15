@@ -48,6 +48,72 @@ export interface ZombieHitResult {
 }
 
 const UP = new THREE.Vector3(0, 1, 0);
+/** Raycast-only material: the mesh stays "visible" to the raycaster but never draws. */
+const HITBOX_MAT = new THREE.MeshBasicMaterial({ visible: false });
+
+type AnimRole = 'idle' | 'walk' | 'run' | 'attack' | 'hit' | 'death';
+
+interface ArchetypeSpec {
+  model: string;
+  hp: number;
+  speed: number;
+  damage: number;
+  radius: number;
+  scale: number;
+  /** Native standing height of the kit model (metres). */
+  height: number;
+  /** Ground speed (m/s) at which the move clip looks right at timeScale 1. */
+  moveClipSpeed: number;
+  clips: Record<AnimRole, string>;
+}
+
+/** All four zombie types are Zombie Apocalypse Kit rigs with their own clips. */
+const ARCHETYPES: Record<ZombieArchetype, ArchetypeSpec> = {
+  shambler: {
+    model: 'zombie_basic',
+    hp: 85,
+    speed: 1.9,
+    damage: 12,
+    radius: 0.38,
+    scale: 1.1,
+    height: 1.25,
+    moveClipSpeed: 1.2,
+    clips: { idle: 'Idle', walk: 'Walk', run: 'Walk', attack: 'Punch', hit: 'HitReact', death: 'Death' },
+  },
+  sprinter: {
+    model: 'zombie_arm',
+    hp: 60,
+    speed: 4.6,
+    damage: 14,
+    radius: 0.38,
+    scale: 1.05,
+    height: 1.45,
+    moveClipSpeed: 3.8,
+    clips: { idle: 'Idle', walk: 'Walk', run: 'Run_Arms', attack: 'Run_Attack', hit: 'HitReact', death: 'Death' },
+  },
+  brute: {
+    model: 'zombie_chubby',
+    hp: 260,
+    speed: 1.7,
+    damage: 26,
+    radius: 0.55,
+    scale: 1.25,
+    height: 1.55,
+    moveClipSpeed: 1.2,
+    clips: { idle: 'Idle', walk: 'Walk', run: 'Walk', attack: 'Punch', hit: 'HitReact', death: 'Death' },
+  },
+  crawler: {
+    model: 'zombie_ribcage',
+    hp: 50,
+    speed: 2.4,
+    damage: 10,
+    radius: 0.32,
+    scale: 1.2,
+    height: 0.6,
+    moveClipSpeed: 1.0,
+    clips: { idle: 'Idle', walk: 'Crawl', run: 'Crawl', attack: 'Jump', hit: 'HitReact', death: 'Death' },
+  },
+};
 
 export class ZombieManager {
   public zombies: ZombieInstance[] = [];
@@ -125,40 +191,13 @@ export class ZombieManager {
   public spawnZombie(pos: THREE.Vector3, archetype: ZombieArchetype): ZombieInstance {
     this.idCounter++;
     const id = `zombie_${this.idCounter}`;
-
-    const modelKey = 'zombie_animated';
-    let hp = 85;
-    let speed = 2.1;
-    let damage = 12;
-    let radius = 0.42;
-    let scaleMod = 1.0;
-    let tintHex = 0xd5ded2;
-
-    if (archetype === 'sprinter') {
-      hp = 60;
-      speed = 5.0;
-      damage = 14;
-      scaleMod = 0.96;
-      tintHex = 0xffb4a8;
-    } else if (archetype === 'brute') {
-      hp = 260;
-      speed = 1.8;
-      damage = 26;
-      radius = 0.62;
-      scaleMod = 1.38;
-      tintHex = 0x9c6a6a;
-    } else if (archetype === 'crawler') {
-      hp = 50;
-      speed = 2.6;
-      damage = 10;
-      scaleMod = 0.92;
-      tintHex = 0x9aa8b8;
-    }
+    const spec = ARCHETYPES[archetype];
+    const modelKey = spec.model;
+    const { hp, speed, damage, radius, scale: scaleMod } = spec;
 
     const group = this.assets.cloneModel(modelKey);
     group.position.set(pos.x + (Math.random() - 0.5) * 3, 0, pos.z + (Math.random() - 0.5) * 3);
-    group.scale.multiplyScalar(scaleMod * (0.94 + Math.random() * 0.12));
-    group.rotation.order = 'YXZ';
+    group.scale.multiplyScalar(scaleMod * (0.95 + Math.random() * 0.1));
     group.userData.zombieId = id;
     this.scene.add(group);
 
@@ -167,16 +206,25 @@ export class ZombieManager {
       o.userData.zombieId = id;
       if ((o as THREE.Mesh).isMesh) {
         const m = o as THREE.Mesh;
-        // Clone material so hit-flash and archetype tint only affect this zombie
+        // Own material per zombie so the hit flash only affects this one
         m.material = Array.isArray(m.material) ? m.material.map((mm) => mm.clone()) : m.material.clone();
-        const mats = Array.isArray(m.material) ? m.material : [m.material];
-        for (const mat of mats) {
-          if (mat instanceof THREE.MeshStandardMaterial) mat.color.setHex(tintHex);
-        }
         m.frustumCulled = false; // skinned bounds don't follow animation
+        m.raycast = () => {}; // bullets use the hitbox below, never the skinned mesh
         meshes.push(m);
       }
     });
+
+    // Invisible hitbox: SkinnedMesh raycasts use a stale bind-pose bounding sphere (missed shots)
+    // and are expensive. A simple shape in the zombie's local space is reliable and cheap.
+    const hbH = spec.height; // local units; the group's scale applies on top
+    const hitbox =
+      archetype === 'crawler'
+        ? new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.5, 1.1), HITBOX_MAT)
+        : new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.26, hbH, 8), HITBOX_MAT);
+    hitbox.position.set(0, archetype === 'crawler' ? 0.25 : hbH / 2, archetype === 'crawler' ? 0.15 : 0);
+    hitbox.userData.zombieId = id;
+    group.add(hitbox);
+    group.userData.hitbox = hitbox;
 
     const body = new CANNON.Body({
       mass: archetype === 'brute' ? 130 : 65,
@@ -192,16 +240,10 @@ export class ZombieManager {
     const actions: Record<string, THREE.AnimationAction> = {};
     if (clips.length > 0) {
       mixer = new THREE.AnimationMixer(group);
-      for (const clip of clips) {
-        const lower = clip.name.toLowerCase();
-        const act = mixer.clipAction(clip);
-        if (lower.includes('crawl')) actions['crawl'] = act;
-        else if (lower.includes('idle')) actions['idle'] = act;
-        else if (lower.includes('run')) actions['run'] = act;
-        else if (lower.includes('walk')) actions['walk'] = act;
-        else if (lower.includes('bite') || lower.includes('attack')) actions['attack'] = act;
+      for (const [role, clipName] of Object.entries(spec.clips)) {
+        const clip = clips.find((c) => c.name === clipName);
+        if (clip) actions[role] = mixer.clipAction(clip);
       }
-      if (Object.keys(actions).length === 0) actions['walk'] = mixer.clipAction(clips[0]);
     }
 
     const z: ZombieInstance = {
@@ -211,7 +253,7 @@ export class ZombieManager {
       group,
       body,
       radius,
-      height: 1.85 * scaleMod,
+      height: spec.height * scaleMod,
       mixer,
       actions,
       currentAnim: '',
@@ -247,10 +289,8 @@ export class ZombieManager {
     return z;
   }
 
-  private moveAnim(z: ZombieInstance, chasing: boolean): string {
-    if (z.archetype === 'crawler') return 'crawl';
-    if (chasing && z.archetype === 'sprinter') return 'run';
-    return 'walk';
+  private moveAnim(z: ZombieInstance, chasing: boolean): AnimRole {
+    return chasing ? 'run' : 'walk';
   }
 
   private randomPatrolNear(pos: THREE.Vector3): THREE.Vector3 {
@@ -261,18 +301,23 @@ export class ZombieManager {
     );
   }
 
-  private playZombieAnim(z: ZombieInstance, name: string, timeScale = 1): void {
+  private playZombieAnim(z: ZombieInstance, name: AnimRole, timeScale = 1, oneShot = false): void {
     if (!z.mixer) return;
     const target = z.actions[name] ?? z.actions['walk'] ?? z.actions['idle'];
     if (!target) return;
-    if (z.currentAnim === name) {
+    if (z.currentAnim === name && !oneShot) {
       target.setEffectiveTimeScale(timeScale);
       return;
     }
     const prev = z.actions[z.currentAnim];
-    if (prev && prev !== target) prev.fadeOut(0.2);
-    target.reset().setEffectiveTimeScale(timeScale).setEffectiveWeight(1).fadeIn(0.2);
-    target.setLoop(THREE.LoopRepeat, Infinity);
+    if (prev && prev !== target) prev.fadeOut(0.15);
+    target.reset().setEffectiveTimeScale(timeScale).setEffectiveWeight(1).fadeIn(0.12);
+    if (oneShot) {
+      target.setLoop(THREE.LoopOnce, 1);
+      target.clampWhenFinished = true;
+    } else {
+      target.setLoop(THREE.LoopRepeat, Infinity);
+    }
     target.play();
     z.currentAnim = name;
   }
@@ -311,6 +356,7 @@ export class ZombieManager {
 
     this.vfx.spawnBloodBurst(hitPoint, hitNormal, headshot ? 16 : 8);
 
+    if (z.hp > 0 && z.archetype !== 'brute') this.playZombieAnim(z, 'hit', 1.4, true);
     if (z.hp <= 0) {
       if (headshot) this.headshots++;
       this.killZombie(z, impulseDir);
@@ -331,7 +377,7 @@ export class ZombieManager {
     const z = this.zombies.find((item) => item.id === id);
     if (!z) return null;
     if (z.state === 'dead') return { killed: false, headshot: false };
-    const headY = z.archetype === 'crawler' ? 0.5 : z.height * 0.8;
+    const headY = z.height * 0.78;
     const headshot = hitPoint.y - z.group.position.y > headY;
     return this.applyDamage(z, damage, hitPoint, hitNormal, impulseDir, headshot);
   }
@@ -350,7 +396,7 @@ export class ZombieManager {
     candidates.sort((a, b) => a.d - b.d);
     const results: ZombieHitResult[] = [];
     for (const { z } of candidates.slice(0, 2)) {
-      const hitPoint = z.group.position.clone().setY(1.3 * (z.height / 1.85));
+      const hitPoint = z.group.position.clone().setY(z.height * 0.65);
       const normal = forward.clone().negate();
       results.push(this.applyDamage(z, damage, hitPoint, normal, forward, false));
       z.staggerTimer = Math.max(z.staggerTimer, 0.45);
@@ -371,8 +417,10 @@ export class ZombieManager {
     this.kills++;
     this.physicsWorld.removeBody(z.body);
     this.audio.playPositional(z.archetype === 'brute' ? 'zombie_roar' : 'zombie_groan2', z.group.position, 0.7, 0.15);
-    // Fall away from the shot
-    z.facing = Math.atan2(impulseDir.x, impulseDir.z);
+    // Face the shooter so the kit's Death clip falls away from the shot
+    z.facing = Math.atan2(-impulseDir.x, -impulseDir.z);
+    z.group.rotation.set(0, z.facing, 0);
+    this.playZombieAnim(z, 'death', 1, true);
     z.hitFlashTimer = 0;
     this.setEmissive(z, 0x000000, 0);
     this.vfx.spawnBloodDecal(z.group.position);
@@ -381,6 +429,7 @@ export class ZombieManager {
   private disposeZombie(z: ZombieInstance): void {
     this.scene.remove(z.group);
     z.mixer?.stopAllAction();
+    (z.group.userData.hitbox as THREE.Mesh | undefined)?.geometry.dispose();
     for (const m of z.meshes) {
       const mats = Array.isArray(m.material) ? m.material : [m.material];
       mats.forEach((mat) => mat.dispose());
@@ -440,16 +489,10 @@ export class ZombieManager {
       const z = this.zombies[i];
 
       if (z.state === 'dead') {
-        // Procedural collapse (the pack has no death clip): ease into the ground
+        // Kit Death clip plays once and holds; corpse sinks away at the end
         z.deathTimer -= dt;
-        if (z.deathFall < 1) {
-          z.deathFall = Math.min(1, z.deathFall + dt * 2.6);
-          const e = 1 - Math.pow(1 - z.deathFall, 3);
-          z.group.rotation.set(-e * Math.PI * 0.48, z.facing + Math.PI, 0);
-          z.group.position.y = e * 0.08;
-          if (z.mixer) z.mixer.update(dt * (1 - e));
-        }
-        if (z.deathTimer < 1.2) z.group.position.y -= dt * 0.35;
+        if (z.mixer && z.deathTimer > 4) z.mixer.update(dt);
+        if (z.deathTimer < 1.2) z.group.position.y -= dt * 0.3;
         if (z.deathTimer <= 0) {
           this.disposeZombie(z);
           this.zombies.splice(i, 1);
@@ -537,7 +580,7 @@ export class ZombieManager {
         z.body.velocity.z *= 0.6;
         const toP = playerPos.clone().sub(zPos);
         this.turnToward(z, Math.atan2(toP.x, toP.z), dt, 10);
-        this.playZombieAnim(z, z.archetype === 'crawler' ? 'crawl' : 'attack', 1.6);
+        this.playZombieAnim(z, 'attack', 1.15);
         if (z.attackWindup > 0) {
           z.attackWindup -= dt;
         } else if (z.attackCooldown <= 0 && distToPlayer < 1.9 + z.radius) {
@@ -556,7 +599,7 @@ export class ZombieManager {
         z.body.velocity.z *= 0.5;
         const toB = barricade.position.clone().sub(zPos);
         this.turnToward(z, Math.atan2(toB.x, toB.z), dt, 8);
-        this.playZombieAnim(z, 'attack', 1.4);
+        this.playZombieAnim(z, 'attack', 1.0);
         if (z.attackCooldown <= 0) {
           z.attackCooldown = 1.3;
           barricade.hp -= z.damage;
@@ -608,7 +651,7 @@ export class ZombieManager {
       }
       const chasing = z.state === 'chase';
       const anim = this.moveAnim(z, chasing);
-      const base = anim === 'run' ? 5.0 : anim === 'crawl' ? 1.6 : 1.3;
+      const base = ARCHETYPES[z.archetype].moveClipSpeed;
       this.playZombieAnim(z, anim, THREE.MathUtils.clamp(moveSpeed / base, 0.5, 1.8));
       this.syncTransform(z, dt);
     }

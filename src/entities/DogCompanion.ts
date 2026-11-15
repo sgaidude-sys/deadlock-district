@@ -31,7 +31,7 @@ export class DogCompanion {
     this.audio = audio;
 
     this.group = assets.cloneModel('dog_shepherd');
-    this.group.position.copy(spawnPos).setY(0.03);
+    this.group.position.copy(spawnPos).setY(0.06);
     this.group.rotation.y = Math.PI * 0.8;
     scene.add(this.group);
 
@@ -97,7 +97,7 @@ export class DogCompanion {
     // If the dog gets stuck far behind (no physics), let it catch up
     if (this.group.position.distanceTo(playerPos) > 28) {
       const behind = new THREE.Vector3(Math.sin(playerYaw), 0, Math.cos(playerYaw)).multiplyScalar(2.5);
-      this.group.position.copy(playerPos).add(behind).setY(0.03);
+      this.group.position.copy(playerPos).add(behind).setY(0.06);
     }
 
     // Nearest threat to the player

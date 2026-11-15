@@ -294,7 +294,7 @@ export class Game {
 
   private startGame(survivorId: SurvivorId): void {
     this.audio.resume();
-    const spawnPos = new THREE.Vector3(-12, 0, 14);
+    const spawnPos = new THREE.Vector3(-10, 0, 12);
     this.player = new PlayerController(
       survivorId,
       spawnPos,
