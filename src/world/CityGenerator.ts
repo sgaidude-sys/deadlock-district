@@ -1,13 +1,26 @@
 import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
 import { AssetManager } from '../core/AssetManager';
-import { VFXManager } from '../core/VFXManager';
+import { ObjectiveMarker, VFXManager } from '../core/VFXManager';
 import { InteractableObject } from '../types/game';
+import {
+  brickTexture,
+  concreteTexture,
+  facadeTextures,
+  grassTexture,
+  groundTexture,
+  metalTexture,
+  roofTexture,
+  tiled,
+  woodFloorTexture,
+} from './ProceduralTextures';
 
 export interface StreetLightNode {
   light: THREE.PointLight;
   bulbMat: THREE.MeshStandardMaterial;
   baseIntensity: number;
+  /** Some lamps die at night, the rest flicker. */
+  failsAtNight: boolean;
 }
 
 export interface BurningBarrel {
@@ -16,18 +29,40 @@ export interface BurningBarrel {
   phase: number;
 }
 
+export interface BarricadeInstance {
+  id: string;
+  interactable: InteractableObject;
+  mesh: THREE.Object3D;
+  body: CANNON.Body;
+  position: THREE.Vector3;
+  hp: number;
+  maxHp: number;
+}
+
 export interface CityWorldData {
+  /** Everything bullets can hit (static world). */
   raycastTargets: THREE.Object3D[];
+  /** Solid meshes the third-person camera must not pass through. */
+  cameraOccluders: THREE.Object3D[];
+  /** Simple box meshes that block zombie line-of-sight. */
+  sightBlockers: THREE.Object3D[];
   interactables: InteractableObject[];
   streetLights: StreetLightNode[];
   burningBarrels: BurningBarrel[];
-  barricadeBodies: Map<string, CANNON.Body>;
+  windowMaterials: THREE.MeshStandardMaterial[];
   extractionBeaconLight: THREE.PointLight;
+  extractionMarker: ObjectiveMarker;
   extractionPosition: THREE.Vector3;
   campfirePosition: THREE.Vector3;
   dogSpawnPosition: THREE.Vector3;
   zombieSpawnPoints: THREE.Vector3[];
 }
+
+/** Top of sidewalk / interior floors. */
+export const FLOOR_Y = 0.06;
+const TILE = 8;
+const ROAD_EXTENT = 64;
+const BUILDING_H = 3.6;
 
 export class CityGenerator {
   private scene: THREE.Scene;
@@ -36,113 +71,116 @@ export class CityGenerator {
   private vfx: VFXManager;
 
   private raycastTargets: THREE.Object3D[] = [];
+  private cameraOccluders: THREE.Object3D[] = [];
+  private sightBlockers: THREE.Object3D[] = [];
   private interactables: InteractableObject[] = [];
   private streetLights: StreetLightNode[] = [];
   private burningBarrels: BurningBarrel[] = [];
-  private barricadeBodies = new Map<string, CANNON.Body>();
-  private zombieSpawnPoints: THREE.Vector3[] = [];
+  private windowMaterials: THREE.MeshStandardMaterial[] = [];
 
-  private wallMat: THREE.MeshStandardMaterial;
-  private trimMat: THREE.MeshStandardMaterial;
-  private floorInteriorMat: THREE.MeshStandardMaterial;
+  private woodMat = new THREE.MeshStandardMaterial({ color: 0x6b4a30, roughness: 0.8 });
+  private darkWoodMat = new THREE.MeshStandardMaterial({ color: 0x3d2a1c, roughness: 0.85 });
+  private metalMat = new THREE.MeshStandardMaterial({ color: 0x8b9096, roughness: 0.45, metalness: 0.5 });
+  private roofMat: THREE.MeshStandardMaterial;
 
-  constructor(
-    scene: THREE.Scene,
-    physicsWorld: CANNON.World,
-    assets: AssetManager,
-    vfx: VFXManager
-  ) {
+  constructor(scene: THREE.Scene, physicsWorld: CANNON.World, assets: AssetManager, vfx: VFXManager) {
     this.scene = scene;
     this.physicsWorld = physicsWorld;
     this.assets = assets;
     this.vfx = vfx;
+    this.roofMat = new THREE.MeshStandardMaterial({ color: 0x9a9a9a, map: roofTexture(), roughness: 0.95 });
+  }
 
-    this.wallMat = new THREE.MeshStandardMaterial({
-      color: 0x3b3836,
-      roughness: 0.9,
-      metalness: 0.05,
-    });
-    this.trimMat = new THREE.MeshStandardMaterial({
-      color: 0x222428,
-      roughness: 0.85,
-      metalness: 0.15,
-    });
-    this.floorInteriorMat = new THREE.MeshStandardMaterial({
-      color: 0x4b4237,
-      roughness: 0.85,
-    });
+  /** Rescale BoxGeometry UVs so a shared tiling texture keeps a constant world-space density. */
+  private static tileBox(geo: THREE.BoxGeometry, sx: number, sy: number, sz: number, tile: number): THREE.BoxGeometry {
+    const uv = geo.getAttribute('uv') as THREE.BufferAttribute;
+    const dims: [number, number][] = [
+      [sz, sy],
+      [sz, sy],
+      [sx, sz],
+      [sx, sz],
+      [sx, sy],
+      [sx, sy],
+    ];
+    for (let f = 0; f < 6; f++) {
+      for (let v = 0; v < 4; v++) {
+        const i = f * 4 + v;
+        uv.setXY(i, (uv.getX(i) * dims[f][0]) / tile, (uv.getY(i) * dims[f][1]) / tile);
+      }
+    }
+    uv.needsUpdate = true;
+    return geo;
+  }
+
+  private texturedBox(sx: number, sy: number, sz: number, mat: THREE.Material, tile = 3): THREE.Mesh {
+    const mesh = new THREE.Mesh(CityGenerator.tileBox(new THREE.BoxGeometry(sx, sy, sz), sx, sy, sz, tile), mat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    return mesh;
   }
 
   public generate(): CityWorldData {
-    this.buildGroundAndRoads();
+    this.buildGround();
+    this.buildStreets();
     this.buildPerimeterWalls();
 
-    // 4-Block Urban Quarantine Zone
-    // 1. SW Block: Quarantine Safehouse
-    const campfirePos = new THREE.Vector3(-28, 0, 26);
-    this.buildEnterableBuilding('Safehouse', -28, 28, 16, 14, 0x4e433c, 'north');
-    this.populateSafehouse(-28, 28);
+    const campfirePos = new THREE.Vector3(-26, 0, 24);
+    this.buildEnterableBuilding('Safehouse', -26, 26, 16, 14, 0xb8aca2, 'north', 'SAFEHOUSE', '#f59e0b');
+    this.populateSafehouse(-26, 26);
 
-    // 2. NW Block: Downtown Pharmacy
-    this.buildEnterableBuilding('Pharmacy', -28, -28, 16, 14, 0x36444e, 'south');
-    this.populatePharmacy(-28, -28);
+    this.buildEnterableBuilding('Pharmacy', -26, -26, 16, 14, 0xa9b4b8, 'south', '+ PHARMACY', '#22c55e');
+    this.populatePharmacy(-26, -26);
 
-    // 3. SE Block: Corner Diner
-    this.buildEnterableBuilding('Diner', 28, 28, 16, 14, 0x523a36, 'west');
-    this.populateDiner(28, 28);
+    this.buildEnterableBuilding('Diner', 26, 26, 16, 14, 0xc4a49a, 'west', "JOE'S DINER", '#ef4444');
+    this.populateDiner(26, 26);
 
-    // 4. NE Block: Overgrown City Park Square
-    this.buildOvergrownPark(28, -28);
+    this.buildYard(26, -26);
+    this.buildOuterBlocks();
+    this.buildStreetFurniture();
+    this.buildVehiclesAndCover();
+    this.scatterDebris();
 
-    // Multi-story background/corner city blocks using Downtown City MegaKit
-    this.buildSkylineBlock(-52, -52, 18, 18, 14);
-    this.buildSkylineBlock(52, -52, 18, 18, 16);
-    this.buildSkylineBlock(-52, 52, 18, 18, 12);
-    this.buildSkylineBlock(52, 52, 18, 18, 15);
-    this.buildSkylineBlock(-52, 0, 14, 22, 11);
-    this.buildSkylineBlock(52, 0, 14, 22, 13);
+    for (const [x, z] of [
+      [-7, 7],
+      [7, -9],
+      [-16, 12],
+      [9, -44],
+      [42, 7],
+      [-42, -7],
+    ]) {
+      this.placeBurningBarrel(x, z);
+    }
 
-    // Streetlights along main avenues
-    this.buildStreetLights();
-
-    // Public Transport & Wrecked Vehicles + Bus Depot choke points
-    this.buildTransitAndCover();
-
-    // Burning Barrels
-    this.placeBurningBarrel(-9, 9);
-    this.placeBurningBarrel(9, -9);
-    this.placeBurningBarrel(-20, 16);
-    this.placeBurningBarrel(10, -45);
-
-    // Extraction Armored Truck at North Gate
-    const extractionPos = new THREE.Vector3(0, 0, -56);
-    const extractionLight = this.buildExtractionZone(extractionPos);
-
-    // Zombie spawn points around alleys, park, and perimeter
-    this.zombieSpawnPoints = [
-      new THREE.Vector3(-42, 0, -12),
-      new THREE.Vector3(42, 0, -12),
-      new THREE.Vector3(40, 0, -40),
-      new THREE.Vector3(18, 0, -38),
-      new THREE.Vector3(-40, 0, 12),
-      new THREE.Vector3(40, 0, 14),
-      new THREE.Vector3(0, 0, 48),
-      new THREE.Vector3(-18, 0, -46),
-      new THREE.Vector3(18, 0, 46),
-      new THREE.Vector3(36, 0, -22),
-    ];
+    const extractionPos = new THREE.Vector3(0, 0, -58);
+    const { light: extractionLight, marker: extractionMarker } = this.buildExtractionZone(extractionPos);
 
     return {
       raycastTargets: this.raycastTargets,
+      cameraOccluders: this.cameraOccluders,
+      sightBlockers: this.sightBlockers,
       interactables: this.interactables,
       streetLights: this.streetLights,
       burningBarrels: this.burningBarrels,
-      barricadeBodies: this.barricadeBodies,
+      windowMaterials: this.windowMaterials,
       extractionBeaconLight: extractionLight,
+      extractionMarker,
       extractionPosition: extractionPos,
       campfirePosition: campfirePos,
-      dogSpawnPosition: new THREE.Vector3(-19, 0, 15),
-      zombieSpawnPoints: this.zombieSpawnPoints,
+      dogSpawnPosition: new THREE.Vector3(-14, 0, 11),
+      zombieSpawnPoints: [
+        new THREE.Vector3(-44, 0, -12),
+        new THREE.Vector3(44, 0, -12),
+        new THREE.Vector3(42, 0, -42),
+        new THREE.Vector3(14, 0, -40),
+        new THREE.Vector3(-44, 0, 14),
+        new THREE.Vector3(44, 0, 16),
+        new THREE.Vector3(2, 0, 52),
+        new THREE.Vector3(-16, 0, -48),
+        new THREE.Vector3(16, 0, 46),
+        new THREE.Vector3(36, 0, -20),
+        new THREE.Vector3(-44, 0, 44),
+        new THREE.Vector3(44, 0, 44),
+      ],
     };
   }
 
@@ -153,7 +191,8 @@ export class CityGenerator {
     sx: number,
     sy: number,
     sz: number,
-    mesh?: THREE.Object3D
+    mesh?: THREE.Object3D,
+    opts: { occludes?: boolean; blocksSight?: boolean } = {}
   ): CANNON.Body {
     const body = new CANNON.Body({
       mass: 0,
@@ -163,94 +202,113 @@ export class CityGenerator {
     this.physicsWorld.addBody(body);
     if (mesh) {
       this.raycastTargets.push(mesh);
+      if (opts.occludes) this.cameraOccluders.push(mesh);
+      if (opts.blocksSight) this.sightBlockers.push(mesh);
     }
     return body;
   }
 
-  private buildGroundAndRoads(): void {
-    // Ground physics plane
-    const groundBody = new CANNON.Body({
-      mass: 0,
-      shape: new CANNON.Plane(),
-    });
+  // ───────────────────────────── Ground & streets ─────────────────────────────
+
+  private buildGround(): void {
+    const groundBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane() });
     groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
     this.physicsWorld.addBody(groundBody);
 
-    // Base concrete/asphalt district ground
-    const groundGeo = new THREE.PlaneGeometry(160, 160);
-    const groundMat = new THREE.MeshStandardMaterial({
-      color: 0x26282c,
-      roughness: 0.95,
-      metalness: 0.05,
-    });
-    const ground = new THREE.Mesh(groundGeo, groundMat);
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(160, 160),
+      new THREE.MeshStandardMaterial({ map: tiled(groundTexture(), 26, 26), roughness: 0.97 })
+    );
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     this.scene.add(ground);
     this.raycastTargets.push(ground);
 
-    // Main avenues (X = 0 and Z = 0)
-    const roadMat = new THREE.MeshStandardMaterial({ color: 0x1a1c20, roughness: 0.92 });
-    const roadNS = new THREE.Mesh(new THREE.PlaneGeometry(14, 140), roadMat);
-    roadNS.rotation.x = -Math.PI / 2;
-    roadNS.position.y = 0.01;
-    roadNS.receiveShadow = true;
-    this.scene.add(roadNS);
-
-    const roadEW = new THREE.Mesh(new THREE.PlaneGeometry(140, 14), roadMat);
-    roadEW.rotation.x = -Math.PI / 2;
-    roadEW.position.y = 0.012;
-    roadEW.receiveShadow = true;
-    this.scene.add(roadEW);
-
-    // Road markings
-    const lineMat = new THREE.MeshStandardMaterial({ color: 0xb48a28, roughness: 0.8 });
-    for (let i = -60; i <= 60; i += 6) {
-      if (Math.abs(i) < 9) continue;
-      const dashNS = new THREE.Mesh(new THREE.PlaneGeometry(0.25, 2.8), lineMat);
-      dashNS.rotation.x = -Math.PI / 2;
-      dashNS.position.set(0, 0.02, i);
-      this.scene.add(dashNS);
-
-      const dashEW = new THREE.Mesh(new THREE.PlaneGeometry(2.8, 0.25), lineMat);
-      dashEW.rotation.x = -Math.PI / 2;
-      dashEW.position.set(i, 0.02, 0);
-      this.scene.add(dashEW);
-    }
-
-    // Sidewalks framing the 4 quadrants
-    const sidewalkMat = new THREE.MeshStandardMaterial({ color: 0x3a3d42, roughness: 0.9 });
-    const quadrants = [
-      [-38, -38],
-      [38, -38],
-      [-38, 38],
-      [38, 38],
-    ];
-    for (const [qx, qz] of quadrants) {
-      const pad = new THREE.Mesh(new THREE.BoxGeometry(58, 0.14, 58), sidewalkMat);
-      pad.position.set(qx, 0.07, qz);
+    // Sidewalk plazas in each quadrant (thin, so characters don't sink)
+    const concrete = concreteTexture();
+    for (const [qx, qz] of [
+      [-1, -1],
+      [1, -1],
+      [-1, 1],
+      [1, 1],
+    ]) {
+      const size = 62;
+      const pad = new THREE.Mesh(
+        new THREE.BoxGeometry(size, FLOOR_Y, size),
+        new THREE.MeshStandardMaterial({ map: tiled(concrete, size / 4, size / 4), roughness: 0.92 })
+      );
+      pad.position.set(qx * (4 + size / 2), FLOOR_Y / 2, qz * (4 + size / 2));
       pad.receiveShadow = true;
       this.scene.add(pad);
     }
   }
 
+  private buildStreets(): void {
+    // Kit tiles: Street_Straight runs along Z with a 6 m carriageway and 1 m curbs.
+    for (let i = -ROAD_EXTENT; i <= ROAD_EXTENT; i += TILE) {
+      if (i === 0) continue;
+      const cracked = Math.abs(i) % 24 === 8;
+      const ns = this.assets.cloneModel(cracked ? 'street_crack1' : 'street_straight');
+      ns.position.set(0, 0, i);
+      this.scene.add(ns);
+      const ew = this.assets.cloneModel(Math.abs(i) % 24 === 16 ? 'street_crack1' : 'street_straight');
+      ew.position.set(i, 0, 0);
+      ew.rotation.y = Math.PI / 2;
+      this.scene.add(ew);
+    }
+    const center = this.assets.cloneModel('street_4way');
+    this.scene.add(center);
+    for (const o of [center]) o.traverse((m) => (m.castShadow = false));
+  }
+
   private buildPerimeterWalls(): void {
     const h = 5;
     const len = 144;
-    const walls = [
-      [0, h / 2, -70, len, h, 2],
-      [0, h / 2, 70, len, h, 2],
-      [-70, h / 2, 0, 2, h, len],
-      [70, h / 2, 0, 2, h, len],
-    ];
-    for (const [x, y, z, sx, sy, sz] of walls) {
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), this.trimMat);
-      mesh.position.set(x, y, z);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
+    const mat = new THREE.MeshStandardMaterial({ map: metalTexture(), roughness: 0.75, metalness: 0.3 });
+    for (const [x, z, sx, sz] of [
+      [0, -70, len, 2],
+      [0, 70, len, 2],
+      [-70, 0, 2, len],
+      [70, 0, 2, len],
+    ]) {
+      const mesh = this.texturedBox(sx, h, sz, mat, 3);
+      mesh.position.set(x, h / 2, z);
       this.scene.add(mesh);
-      this.addStaticBox(x, y, z, sx, sy, sz, mesh);
+      this.addStaticBox(x, h / 2, z, sx, h, sz, mesh, { occludes: true, blocksSight: true });
     }
+  }
+
+  // ───────────────────────────── Buildings ─────────────────────────────
+
+  private makeSign(text: string, color: string, width: number): THREE.Mesh {
+    const c = document.createElement('canvas');
+    c.width = 512;
+    c.height = 128;
+    const g = c.getContext('2d')!;
+    g.fillStyle = '#0b0c0f';
+    g.fillRect(0, 0, 512, 128);
+    g.strokeStyle = color;
+    g.lineWidth = 6;
+    g.strokeRect(8, 8, 496, 112);
+    g.font = 'bold 64px Impact, "Arial Black", sans-serif';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.shadowColor = color;
+    g.shadowBlur = 18;
+    g.fillStyle = color;
+    g.fillText(text, 256, 68);
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const mat = new THREE.MeshStandardMaterial({
+      map: tex,
+      emissive: 0xffffff,
+      emissiveMap: tex,
+      emissiveIntensity: 0.9,
+      roughness: 0.6,
+    });
+    mat.userData.sign = true;
+    this.windowMaterials.push(mat);
+    return new THREE.Mesh(new THREE.PlaneGeometry(width, width / 4), mat);
   }
 
   private buildEnterableBuilding(
@@ -259,95 +317,81 @@ export class CityGenerator {
     cz: number,
     w: number,
     d: number,
-    colorHex: number,
-    doorSide: 'north' | 'south' | 'east' | 'west'
+    tintHex: number,
+    doorSide: 'north' | 'south' | 'east' | 'west',
+    signText: string,
+    signColor: string
   ): void {
-    const h = 4.2;
-    const t = 0.45;
-    const mat = new THREE.MeshStandardMaterial({ color: colorHex, roughness: 0.88 });
+    const h = BUILDING_H;
+    const t = 0.4;
+    const mat = new THREE.MeshStandardMaterial({ color: tintHex, map: brickTexture(), roughness: 0.9 });
 
-    // Interior floor
-    const floor = new THREE.Mesh(new THREE.BoxGeometry(w - 0.2, 0.18, d - 0.2), this.floorInteriorMat);
-    floor.position.set(cx, 0.09, cz);
+    const floorMat = new THREE.MeshStandardMaterial({ map: tiled(woodFloorTexture(), w / 3, d / 3), roughness: 0.75 });
+    const floor = new THREE.Mesh(new THREE.BoxGeometry(w - 0.2, 0.02, d - 0.2), floorMat);
+    floor.position.set(cx, FLOOR_Y + 0.01, cz);
     floor.receiveShadow = true;
     this.scene.add(floor);
 
-    // Roof (slightly overhanging)
-    const roof = new THREE.Mesh(new THREE.BoxGeometry(w + 0.6, 0.4, d + 0.6), this.trimMat);
-    roof.position.set(cx, h + 0.2, cz);
-    roof.castShadow = true;
-    roof.receiveShadow = true;
+    const roof = this.texturedBox(w + 0.6, 0.35, d + 0.6, this.roofMat, 4);
+    roof.position.set(cx, h + 0.17, cz);
     this.scene.add(roof);
     this.raycastTargets.push(roof);
+    this.cameraOccluders.push(roof);
 
-    // Helper for wall segments (splits wall if it's the doorSide)
-    const makeWall = (
-      x: number,
-      z: number,
-      sx: number,
-      sz: number,
-      hasDoor: boolean,
-      isHorizontal: boolean
-    ) => {
-      if (!hasDoor) {
-        const wall = new THREE.Mesh(new THREE.BoxGeometry(sx, h, sz), mat);
-        wall.position.set(x, h / 2, z);
-        wall.castShadow = true;
-        wall.receiveShadow = true;
+    const trimMat = new THREE.MeshStandardMaterial({ color: 0x55575c, roughness: 0.9 });
+    for (const s of [-1, 1]) {
+      const tz = this.texturedBox(w + 0.8, 0.45, 0.3, trimMat, 3);
+      tz.position.set(cx, h + 0.5, cz + s * (d / 2 + 0.3));
+      this.scene.add(tz);
+      const tx = this.texturedBox(0.3, 0.45, d + 0.8, trimMat, 3);
+      tx.position.set(cx + s * (w / 2 + 0.3), h + 0.5, cz);
+      this.scene.add(tx);
+    }
+
+    const makeWall = (x: number, z: number, sx: number, sz: number, hasDoor: boolean, isHorizontal: boolean) => {
+      const addSeg = (px: number, pz: number, ssx: number, ssz: number) => {
+        const wall = this.texturedBox(ssx, h, ssz, mat, 2);
+        wall.position.set(px, h / 2, pz);
         this.scene.add(wall);
-        this.addStaticBox(x, h / 2, z, sx, h, sz, wall);
+        this.addStaticBox(px, h / 2, pz, ssx, h, ssz, wall, { occludes: true, blocksSight: true });
+      };
+      if (!hasDoor) {
+        addSeg(x, z, sx, sz);
         return;
       }
 
       const doorW = 3.0;
+      const header = this.texturedBox(isHorizontal ? doorW : sx, 0.9, isHorizontal ? sz : doorW, mat, 2);
+      header.position.set(x, h - 0.45, z);
+      this.scene.add(header);
+      this.cameraOccluders.push(header);
+
+      const sign = this.makeSign(signText, signColor, 3.4);
+      const out = doorSide === 'north' || doorSide === 'west' ? -1 : 1;
+      if (isHorizontal) {
+        sign.position.set(x, h - 0.45, z + out * (sz / 2 + 0.03));
+        sign.rotation.y = out > 0 ? 0 : Math.PI;
+      } else {
+        sign.position.set(x + out * (sx / 2 + 0.03), h - 0.45, z);
+        sign.rotation.y = out > 0 ? Math.PI / 2 : -Math.PI / 2;
+      }
+      this.scene.add(sign);
+
       if (isHorizontal) {
         const segW = (sx - doorW) / 2;
-        const left = new THREE.Mesh(new THREE.BoxGeometry(segW, h, sz), mat);
-        left.position.set(x - (doorW / 2 + segW / 2), h / 2, z);
-        left.castShadow = true;
-        left.receiveShadow = true;
-        this.scene.add(left);
-        this.addStaticBox(left.position.x, h / 2, z, segW, h, sz, left);
-
-        const right = new THREE.Mesh(new THREE.BoxGeometry(segW, h, sz), mat);
-        right.position.set(x + (doorW / 2 + segW / 2), h / 2, z);
-        right.castShadow = true;
-        right.receiveShadow = true;
-        this.scene.add(right);
-        this.addStaticBox(right.position.x, h / 2, z, segW, h, sz, right);
-
-        // Header above door
-        const header = new THREE.Mesh(new THREE.BoxGeometry(doorW, 1.1, sz), mat);
-        header.position.set(x, h - 0.55, z);
-        this.scene.add(header);
+        addSeg(x - (doorW / 2 + segW / 2), z, segW, sz);
+        addSeg(x + (doorW / 2 + segW / 2), z, segW, sz);
       } else {
         const segD = (sz - doorW) / 2;
-        const top = new THREE.Mesh(new THREE.BoxGeometry(sx, h, segD), mat);
-        top.position.set(x, h / 2, z - (doorW / 2 + segD / 2));
-        top.castShadow = true;
-        top.receiveShadow = true;
-        this.scene.add(top);
-        this.addStaticBox(x, h / 2, top.position.z, sx, h, segD, top);
-
-        const bot = new THREE.Mesh(new THREE.BoxGeometry(sx, h, segD), mat);
-        bot.position.set(x, h / 2, z + (doorW / 2 + segD / 2));
-        bot.castShadow = true;
-        bot.receiveShadow = true;
-        this.scene.add(bot);
-        this.addStaticBox(x, h / 2, bot.position.z, sx, h, segD, bot);
-
-        const header = new THREE.Mesh(new THREE.BoxGeometry(sx, 1.1, doorW), mat);
-        header.position.set(x, h - 0.55, z);
-        this.scene.add(header);
+        addSeg(x, z - (doorW / 2 + segD / 2), sx, segD);
+        addSeg(x, z + (doorW / 2 + segD / 2), sx, segD);
       }
 
-      // Add barricadable door interactable!
-      const barricadeId = `barricade_${id}`;
       this.interactables.push({
-        id: barricadeId,
+        id: `barricade_${id}`,
         type: 'barricade',
         label: `Barricade ${id} Door`,
-        subLabel: 'Costs 10 Scrap (Blocks Zombies)',
+        subLabel: 'Costs 10 Scrap • Zombies can break it',
         position: new THREE.Vector3(x, 0.8, z),
         radius: 3.0,
         consumed: false,
@@ -360,352 +404,629 @@ export class CityGenerator {
     makeWall(cx - w / 2, cz, t, d, doorSide === 'west', false);
     makeWall(cx + w / 2, cz, t, d, doorSide === 'east', false);
 
-    // Warm interior ceiling bulb
-    const light = new THREE.PointLight(0xffd2a1, 1.4, 15, 1.8);
-    light.position.set(cx, h - 0.6, cz);
+    const light = new THREE.PointLight(0xffd2a1, 3.0, 15, 1.6);
+    light.position.set(cx, h - 0.5, cz);
     this.scene.add(light);
   }
 
-  private populateSafehouse(cx: number, cz: number): void {
-    this.placeModel('int_bed', cx - 5, cz + 4, Math.PI / 2, true);
-    this.placeModel('int_bookshelf', cx + 5.5, cz + 5.5, Math.PI, true);
-    this.placeModel('int_table', cx + 3.5, cz - 2, 0, true);
-    this.placeModel('int_chair', cx + 2, cz - 2, Math.PI / 2, false);
+  /** Background apartment blocks with a window facade that lights up at night. */
+  private buildOuterBlocks(): void {
+    const { map, emissive } = facadeTextures();
+    const blocks: [number, number, number, number, number, number][] = [
+      // x, z, w, d, h, tint
+      [-55, -55, 18, 18, 16, 0x8f8a86],
+      [55, -55, 18, 18, 12, 0x9a948a],
+      [-55, 55, 18, 18, 12, 0x868c92],
+      [55, 55, 18, 18, 18, 0x948a86],
+      [-58, -26, 12, 20, 10, 0x9c968e],
+      [-58, 0, 12, 16, 14, 0x8a8f8c],
+      [-58, 26, 12, 20, 9, 0x928c88],
+      [58, -26, 12, 20, 13, 0x8c8e94],
+      [58, 0, 12, 16, 9, 0x989088],
+      [58, 26, 12, 20, 15, 0x8e8a84],
+      [-26, -58, 20, 12, 11, 0x8a8a8e],
+      [26, -58, 20, 12, 14, 0x968e88],
+      [-26, 58, 20, 12, 13, 0x8c9090],
+      [26, 58, 20, 12, 10, 0x908a86],
+    ];
+    for (const [x, z, w, d, h, tint] of blocks) {
+      const mat = new THREE.MeshStandardMaterial({
+        color: tint,
+        map,
+        emissive: 0xffffff,
+        emissiveMap: emissive,
+        emissiveIntensity: 0,
+        roughness: 0.9,
+      });
+      this.windowMaterials.push(mat);
+      // Box face order: +x, -x, +y (roof), -y, +z, -z
+      const mesh = this.texturedBox(w, h, d, mat, 8);
+      mesh.material = [mat, mat, this.roofMat, this.roofMat, mat, mat];
+      mesh.position.set(x, h / 2, z);
+      this.scene.add(mesh);
+      this.addStaticBox(x, h / 2, z, w, h, d, mesh, { occludes: true, blocksSight: true });
+    }
+    // Landmark water tower on one rooftop
+    const tower = this.assets.cloneModel('water_tower');
+    tower.position.set(55, 18, 55);
+    this.scene.add(tower);
+  }
 
-    // Starter Campfire (Safe-zone heal/craft hub)
-    const firePos = new THREE.Vector3(cx, 0.15, cz - 2);
-    const bonfire = this.assets.cloneModel('surv_bonfire');
-    bonfire.position.copy(firePos);
-    this.scene.add(bonfire);
-    this.vfx.registerFireEmitter(firePos, 1.0);
+  // ───────────────────────────── Furniture (primitives) ─────────────────────────────
+
+  private addSolid(group: THREE.Object3D, x: number, z: number, rotY: number): void {
+    group.position.set(x, FLOOR_Y, z);
+    group.rotation.y = rotY;
+    group.traverse((o) => {
+      o.castShadow = true;
+      o.receiveShadow = true;
+    });
+    this.scene.add(group);
+    group.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(group);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    this.addStaticBox(center.x, center.y, center.z, Math.max(0.4, size.x), Math.max(0.4, size.y), Math.max(0.4, size.z), group);
+  }
+
+  private makeTable(w = 1.6, d = 0.9): THREE.Group {
+    const g = new THREE.Group();
+    const top = new THREE.Mesh(new THREE.BoxGeometry(w, 0.06, d), this.woodMat);
+    top.position.y = 0.74;
+    g.add(top);
+    for (const sx of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        const leg = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.72, 0.06), this.darkWoodMat);
+        leg.position.set(sx * (w / 2 - 0.08), 0.36, sz * (d / 2 - 0.08));
+        g.add(leg);
+      }
+    }
+    return g;
+  }
+
+  private makeCounter(len: number): THREE.Group {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(len, 0.95, 0.7), this.darkWoodMat);
+    body.position.y = 0.475;
+    g.add(body);
+    const top = new THREE.Mesh(
+      new THREE.BoxGeometry(len + 0.1, 0.06, 0.85),
+      new THREE.MeshStandardMaterial({ color: 0xc9c4bc, roughness: 0.35 })
+    );
+    top.position.y = 0.98;
+    g.add(top);
+    return g;
+  }
+
+  private makeShelf(len = 2.2): THREE.Group {
+    const g = new THREE.Group();
+    for (const sx of [-1, 1]) {
+      const side = new THREE.Mesh(new THREE.BoxGeometry(0.05, 1.9, 0.45), this.metalMat);
+      side.position.set((sx * len) / 2, 0.95, 0);
+      g.add(side);
+    }
+    const boxColors = [0xb91c1c, 0x2563eb, 0xf5f5f4, 0x16a34a, 0xeab308];
+    for (let i = 0; i < 4; i++) {
+      const shelf = new THREE.Mesh(new THREE.BoxGeometry(len, 0.04, 0.45), this.metalMat);
+      shelf.position.y = 0.15 + i * 0.5;
+      g.add(shelf);
+      for (let k = 0; k < 5; k++) {
+        if (Math.random() < 0.35) continue;
+        const item = new THREE.Mesh(
+          new THREE.BoxGeometry(0.25, 0.22 + Math.random() * 0.12, 0.25),
+          new THREE.MeshStandardMaterial({ color: boxColors[(i + k) % boxColors.length], roughness: 0.7 })
+        );
+        item.position.set(-len / 2 + 0.3 + k * (len - 0.6) / 4, shelf.position.y + 0.14, 0);
+        item.rotation.y = (Math.random() - 0.5) * 0.4;
+        g.add(item);
+      }
+    }
+    return g;
+  }
+
+  private makeBed(): THREE.Group {
+    const g = new THREE.Group();
+    const frame = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.35, 2.1), this.darkWoodMat);
+    frame.position.y = 0.18;
+    g.add(frame);
+    const mattress = new THREE.Mesh(
+      new THREE.BoxGeometry(1.0, 0.2, 2.0),
+      new THREE.MeshStandardMaterial({ color: 0x8a8070, roughness: 0.95 })
+    );
+    mattress.position.y = 0.45;
+    g.add(mattress);
+    const blanket = new THREE.Mesh(
+      new THREE.BoxGeometry(1.04, 0.06, 1.2),
+      new THREE.MeshStandardMaterial({ color: 0x5a2420, roughness: 0.95 })
+    );
+    blanket.position.set(0, 0.57, 0.35);
+    g.add(blanket);
+    return g;
+  }
+
+  private makeFridge(): THREE.Group {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(0.85, 1.95, 0.75),
+      new THREE.MeshStandardMaterial({ color: 0xdcdcd6, roughness: 0.35, metalness: 0.2 })
+    );
+    body.position.y = 0.975;
+    g.add(body);
+    const handle = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.6, 0.04), this.metalMat);
+    handle.position.set(0.32, 1.2, 0.4);
+    g.add(handle);
+    return g;
+  }
+
+  private buildCampfire(pos: THREE.Vector3): void {
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      const block = this.assets.cloneModel('prop_cinder');
+      block.position.set(pos.x + Math.cos(a) * 0.55, FLOOR_Y, pos.z + Math.sin(a) * 0.55);
+      block.rotation.y = -a + Math.PI / 2;
+      this.scene.add(block);
+    }
+    for (let i = 0; i < 3; i++) {
+      const log = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.07, 0.7, 6), this.darkWoodMat);
+      log.position.set(pos.x, FLOOR_Y + 0.12, pos.z);
+      log.rotation.set(Math.PI / 2 - 0.35, (i / 3) * Math.PI * 2, 0, 'YXZ');
+      this.scene.add(log);
+    }
+    const embers = new THREE.Mesh(
+      new THREE.CircleGeometry(0.35, 12),
+      new THREE.MeshStandardMaterial({ color: 0x220a02, emissive: 0xff5a1a, emissiveIntensity: 1.6 })
+    );
+    embers.rotation.x = -Math.PI / 2;
+    embers.position.set(pos.x, FLOOR_Y + 0.03, pos.z);
+    this.scene.add(embers);
+    this.vfx.registerFireEmitter(new THREE.Vector3(pos.x, FLOOR_Y + 0.15, pos.z), 0.9);
 
     const fireLight = new THREE.PointLight(0xff7b29, 3.0, 12, 2);
-    fireLight.position.set(firePos.x, 1.1, firePos.z);
+    fireLight.position.set(pos.x, 1.0, pos.z);
     this.scene.add(fireLight);
     this.burningBarrels.push({ light: fireLight, baseIntensity: 3.0, phase: 0 });
+  }
 
+  private populateSafehouse(cx: number, cz: number): void {
+    this.addSolid(this.makeBed(), cx - 5.5, cz + 4.5, 0);
+    this.addSolid(this.makeBed(), cx - 3.6, cz + 4.5, 0);
+    this.addSolid(this.makeTable(), cx + 4, cz - 2.5, 0);
+    this.placeModel('prop_couch', cx + 1, cz + 5.6, Math.PI, true);
+    this.placeModel('prop_barrel', cx + 6.8, cz + 5.8, 0, true);
+    this.placeModel('prop_wheels', cx + 6.6, cz - 5.6, 0.4, true);
+    this.placeModel('prop_pallet', cx - 6.6, cz - 1, Math.PI / 2, false);
+
+    const firePos = new THREE.Vector3(cx, 0, cz - 2);
+    this.buildCampfire(firePos);
     this.interactables.push({
       id: 'safehouse_campfire',
       type: 'campfire',
-      label: 'Campfire Hub',
-      subLabel: 'Rest (Heal) & Craft Ammo/Medkits [Tab]',
+      label: 'Campfire',
+      subLabel: 'Rest to heal • Craft anytime with [Tab]',
       position: firePos.clone(),
-      radius: 2.8,
+      radius: 2.6,
     });
 
-    // Starter Supply Chest
-    this.spawnLootCrate('crate_safehouse', cx - 5, cz - 3, 'ammo_pistol');
+    this.spawnLootCrate('crate_safehouse', cx - 5.5, cz - 4, 'ammo_pistol');
   }
 
   private populatePharmacy(cx: number, cz: number): void {
-    this.placeModel('int_counter', cx, cz - 3.5, 0, true);
-    this.placeModel('int_bookshelf', cx - 5.5, cz - 4.5, Math.PI / 2, true);
-    this.placeModel('int_bookshelf', cx + 5.5, cz - 4.5, -Math.PI / 2, true);
+    this.addSolid(this.makeCounter(5), cx, cz - 3.5, 0);
+    this.addSolid(this.makeShelf(), cx - 6.6, cz - 3.5, Math.PI / 2);
+    this.addSolid(this.makeShelf(), cx + 6.6, cz - 3.5, -Math.PI / 2);
+    this.addSolid(this.makeShelf(), cx - 2.5, cz + 0.8, 0);
+    this.addSolid(this.makeShelf(), cx + 2.5, cz + 0.8, 0);
 
-    this.spawnLootCrate('crate_pharm_1', cx - 4, cz + 2, 'medkit');
-    this.spawnLootCrate('crate_pharm_2', cx + 4, cz + 2, 'ammo_shells');
-    this.spawnJerrycan('jerrycan_1', cx + 5, cz - 1.5);
+    this.spawnLootCrate('crate_pharm_1', cx - 4.5, cz + 3.5, 'medkit');
+    this.spawnLootCrate('crate_pharm_2', cx + 4.5, cz + 3.5, 'ammo_shells');
+    this.spawnJerrycan('jerrycan_1', cx + 5, cz - 1.2);
   }
 
   private populateDiner(cx: number, cz: number): void {
-    this.placeModel('int_counter', cx + 4.5, cz, -Math.PI / 2, true);
-    this.placeModel('int_fridge', cx + 5.8, cz + 4.5, -Math.PI / 2, true);
-    this.placeModel('int_table', cx - 3, cz + 3, 0, true);
-    this.placeModel('int_table', cx - 3, cz - 3, 0, true);
+    this.addSolid(this.makeCounter(6), cx + 4.5, cz, -Math.PI / 2);
+    this.addSolid(this.makeFridge(), cx + 6.7, cz + 5, -Math.PI / 2);
+    this.addSolid(this.makeTable(1.4, 1.4), cx - 3, cz + 3, 0);
+    this.addSolid(this.makeTable(1.4, 1.4), cx - 3, cz - 3, 0);
+    this.addSolid(this.makeTable(1.4, 1.4), cx + 0.5, cz - 4.5, 0);
 
-    this.spawnLootCrate('crate_diner_1', cx + 3.5, cz - 4, 'burger');
-    this.spawnLootCrate('crate_diner_2', cx - 4, cz + 4.5, 'water_bottle');
+    this.spawnLootCrate('crate_diner_1', cx + 2, cz + 5, 'burger');
+    this.spawnLootCrate('crate_diner_2', cx - 5.5, cz + 5.2, 'water_bottle');
     this.spawnRadioBeacon('radio_beacon', cx + 4.5, cz + 0.2);
   }
 
-  private buildOvergrownPark(cx: number, cz: number): void {
-    const grassMat = new THREE.MeshStandardMaterial({ color: 0x263826, roughness: 0.95 });
-    const grass = new THREE.Mesh(new THREE.BoxGeometry(34, 0.18, 34), grassMat);
-    grass.position.set(cx, 0.09, cz);
+  /** NE block: an overgrown freight yard of shipping containers. */
+  private buildYard(cx: number, cz: number): void {
+    const grass = new THREE.Mesh(
+      new THREE.BoxGeometry(34, 0.02, 34),
+      new THREE.MeshStandardMaterial({ map: tiled(grassTexture(), 8, 8), roughness: 0.97 })
+    );
+    grass.position.set(cx, FLOOR_Y + 0.01, cz);
     grass.receiveShadow = true;
     this.scene.add(grass);
 
-    // Tent & camp
-    this.placeModel('surv_tent', cx + 6, cz - 6, -Math.PI / 4, true);
+    this.placeModel('prop_container_green', cx - 8, cz - 9, 0, true);
+    this.placeModel('prop_container_red', cx - 8, cz - 6.2, 0.05, true);
+    this.placeModel('prop_container_red', cx + 9, cz + 4, Math.PI / 2, true);
+    this.placeModel('prop_container_green', cx + 3, cz - 11, -0.2, true);
+    this.placeModel('prop_container_green', cx - 10, cz + 9, Math.PI / 2 + 0.1, true);
+    this.placeModel('prop_pipes', cx + 2, cz + 2, 0.3, true);
+    this.placeModel('prop_pipes', cx + 3, cz + 3.2, 0.2, true);
+    this.placeModel('prop_wheels', cx - 3, cz - 2, 0, true);
+    this.placeModel('prop_pallet', cx - 1, cz + 7, 0.6, false);
+    this.placeModel('prop_pallet_broken', cx + 5, cz - 4, 1.2, false);
+    this.placeModel('prop_barrel', cx + 11, cz - 9, 0, true);
+    this.placeModel('prop_barrel', cx + 11.8, cz - 8.4, 0, true);
 
-    // Dead trees, bushes, boulders
-    const treeCoords = [
-      [cx - 10, cz - 10],
-      [cx + 11, cz + 8],
-      [cx - 8, cz + 10],
-      [cx + 10, cz - 12],
-    ];
-    for (let i = 0; i < treeCoords.length; i++) {
-      const [tx, tz] = treeCoords[i];
-      this.placeModel(i % 2 === 0 ? 'nat_deadtree' : 'nat_deadtree2', tx, tz, i * 1.2, true);
-    }
+    const tower = this.assets.cloneModel('water_tower');
+    tower.position.set(cx + 10, FLOOR_Y, cz + 11);
+    this.scene.add(tower);
+    this.addStaticBox(cx + 10, 4.5, cz + 11, 2.4, 9, 2.4, tower, { occludes: true });
 
-    const bushCoords = [
-      [cx - 4, cz - 6],
-      [cx + 4, cz + 5],
-      [cx - 12, cz + 2],
-      [cx + 2, cz - 11],
-    ];
-    for (const [bx, bz] of bushCoords) {
-      this.placeModel('nat_bush_large', bx, bz, Math.random() * 6, false);
-    }
-
-    this.placeModel('nat_rock', cx - 3, cz + 2, 0.5, true);
-    this.placeModel('nat_rock', cx + 5, cz - 1, 2.1, true);
-
-    // Park Jerrycan & Loot
-    this.spawnJerrycan('jerrycan_2', cx + 6, cz - 4);
+    this.spawnJerrycan('jerrycan_2', cx + 6, cz - 1.5);
     this.spawnLootCrate('crate_park', cx - 4, cz + 4, 'ammo_rifle');
   }
 
-  private buildSkylineBlock(cx: number, cz: number, w: number, d: number, h: number): void {
-    const mat = new THREE.MeshStandardMaterial({ color: 0x2a2d34, roughness: 0.9 });
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
-    mesh.position.set(cx, h / 2, cz);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    this.scene.add(mesh);
-    this.addStaticBox(cx, h / 2, cz, w, h, d, mesh);
+  // ───────────────────────────── Street furniture ─────────────────────────────
 
-    // Add Downtown City MegaKit facade accents along street-facing side
-    const facade = this.assets.cloneModel('city_brick_wall');
-    facade.position.set(cx, 0, cz + (cz < 0 ? d / 2 + 0.1 : -d / 2 - 0.1));
-    facade.scale.set(2.2, 2.2, 2.2);
-    this.scene.add(facade);
-  }
-
-  private buildStreetLights(): void {
-    const positions = [
-      [-8, -22, 0],
-      [8, -22, Math.PI],
-      [-8, 22, 0],
-      [8, 22, Math.PI],
-      [-24, -8, Math.PI / 2],
-      [24, 8, -Math.PI / 2],
+  private buildStreetFurniture(): void {
+    // [x, z, rotY] — the lamp arm extends along local +Z, so rotate it over the road.
+    const lamps: [number, number, number][] = [
+      [-4.6, -20, Math.PI / 2],
+      [4.6, -36, -Math.PI / 2],
+      [-4.6, 20, Math.PI / 2],
+      [4.6, 36, -Math.PI / 2],
+      [-20, 4.6, Math.PI],
+      [20, -4.6, 0],
+      [-40, -4.6, 0],
+      [40, 4.6, Math.PI],
+      [4.6, -52, -Math.PI / 2],
     ];
-    const bulbMat = new THREE.MeshStandardMaterial({
-      color: 0xfff3d1,
-      emissive: 0xffd27d,
-      emissiveIntensity: 2.0,
+    lamps.forEach(([x, z, rot], i) => {
+      const lamp = this.assets.cloneModel('street_light');
+      lamp.position.set(x, 0, z);
+      lamp.rotation.y = rot;
+      this.scene.add(lamp);
+      this.addStaticBox(x, 3, z, 0.35, 6, 0.35, lamp);
+
+      let bulbMat: THREE.MeshStandardMaterial | null = null;
+      lamp.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach((m, mi) => {
+          if (m instanceof THREE.MeshStandardMaterial && /light/i.test(m.name)) {
+            const own = m.clone();
+            own.emissive.setHex(0xffd27d);
+            own.emissiveIntensity = 1.5;
+            if (Array.isArray(mesh.material)) mesh.material[mi] = own;
+            else mesh.material = own;
+            bulbMat = own;
+          }
+        });
+      });
+      const arm = new THREE.Vector3(Math.sin(rot), 0, Math.cos(rot)).multiplyScalar(2.6);
+      const light = new THREE.PointLight(0xffd59a, 2.6, 20, 1.6);
+      light.position.set(x + arm.x, 6.1, z + arm.z);
+      this.scene.add(light);
+      this.streetLights.push({
+        light,
+        bulbMat: bulbMat ?? new THREE.MeshStandardMaterial(),
+        baseIntensity: 2.6,
+        failsAtNight: i % 3 === 1,
+      });
     });
 
-    for (const [x, z, rot] of positions) {
-      const pole = this.assets.cloneModel('street_light_single');
-      pole.position.set(x, 0, z);
-      pole.rotation.y = rot;
-      this.scene.add(pole);
-
-      const light = new THREE.PointLight(0xffdca8, 2.2, 22, 1.7);
-      light.position.set(x, 5.1, z);
-      this.scene.add(light);
-
-      const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.16, 8, 8), bulbMat);
-      bulb.position.set(x, 5.1, z);
-      this.scene.add(bulb);
-
-      this.streetLights.push({ light, bulbMat, baseIntensity: 2.2 });
+    for (const [x, z, rot] of [
+      [-4.6, -4.6, Math.PI / 2],
+      [4.6, 4.6, -Math.PI / 2],
+    ]) {
+      const tl = this.assets.cloneModel('traffic_light');
+      tl.position.set(x, 0, z);
+      tl.rotation.y = rot;
+      this.scene.add(tl);
+      this.addStaticBox(x, 2.3, z, 0.35, 4.6, 0.35, tl);
     }
+
+    const sign = this.assets.cloneModel('town_sign');
+    sign.position.set(14, FLOOR_Y, 62);
+    sign.rotation.y = Math.PI;
+    this.scene.add(sign);
+    this.raycastTargets.push(sign);
   }
 
-  private buildTransitAndCover(): void {
-    // Central Bus Depot & Intersection Wreckage
-    this.placeVehicle('veh_bus', -2, -20, 0.35);
-    this.placeVehicle('veh_schoolbus', 22, -4, Math.PI / 2 + 0.2);
-    this.placeVehicle('veh_taxi', 5, 16, -0.5);
-    this.placeVehicle('veh_ambulance', -16, -5, Math.PI / 2 - 0.2);
+  private buildVehiclesAndCover(): void {
+    // Kit vehicles are ~5 m long along local Z.
+    this.placeVehicle('veh_sports', -1.5, -20, 0.25);
+    this.placeVehicle('veh_pickup', 1.8, 18, Math.PI + 0.3);
+    this.placeVehicle('veh_truck', 20, -1.2, Math.PI / 2 + 0.1);
+    this.placeVehicle('veh_pickup_armored', -18, 1.4, -Math.PI / 2 + 0.25);
+    this.placeVehicle('veh_sports_armored', -1.6, 38, 0.4);
+    this.placeVehicle('veh_pickup', 34, 1.5, Math.PI / 2 - 0.2);
+    this.placeVehicle('veh_sports', 1.2, -40, 2.9);
 
-    // Jerrycan #3 at the Central Bus Depot
-    this.spawnJerrycan('jerrycan_3', 2, -23);
-    this.spawnLootCrate('crate_ambulance', -16, -2.5, 'medkit');
-    this.spawnLootCrate('crate_bus', 22, 0.5, 'canned_food');
+    this.spawnJerrycan('jerrycan_3', 5.5, -22);
+    this.spawnLootCrate('crate_ambulance', -18, 5.5, 'medkit');
+    this.spawnLootCrate('crate_bus', 20, 5, 'canned_food');
+    this.spawnLootCrate('crate_pickup', -5.5, 40, 'ammo_pistol');
+    this.spawnLootCrate('crate_truck', 34, 5.5, 'chocolate');
 
-    // Shipping containers & road barriers
-    this.placeModel('prop_container_green', -12, -38, 0.1, true);
-    this.placeModel('prop_container_red', 14, 38, -0.15, true);
-    this.placeModel('prop_barrier', -4, -10, 0.1, true);
-    this.placeModel('prop_barrier', 4, 10, 0.2, true);
-    this.placeModel('prop_hydrant', -8.5, 11, 0, false);
-    this.placeModel('prop_cone', -3, -8, 0, false);
-    this.placeModel('prop_cone', 3, 8, 0, false);
+    this.placeModel('prop_container_green', -12, -40, 0.1, true);
+    this.placeModel('prop_container_red', 12, 40, -0.15, true);
+    this.placeModel('prop_barrier', -2, -10, 0.1, true);
+    this.placeModel('prop_barrier', 2, 10, 0.2, true);
+    this.placeModel('prop_barrier2', -10, 2, Math.PI / 2 + 0.1, true);
+    this.placeModel('prop_plastic_barrier', 10, -2, Math.PI / 2 - 0.2, true);
+    this.placeModel('prop_plastic_barrier', 11.2, -0.8, Math.PI / 2 + 0.3, true);
+    this.placeModel('prop_hydrant', -6, 11, 0, true);
+    this.placeModel('prop_hydrant', 6, -30, 0, true);
+    this.placeModel('prop_cone', -2.5, -7, 0, false);
+    this.placeModel('prop_cone2', 2.5, 7, 0, false);
+    this.placeModel('prop_cone', -0.8, -8.5, 0.6, false);
+    this.placeModel('prop_cone2', 7.5, 1.5, 0.3, false);
 
-    // Dog spawn interactable (Recruitable Companion Dog near Safehouse street)
     this.interactables.push({
       id: 'recruit_dog',
       type: 'dog',
       label: 'Recruit Survivor Dog',
       subLabel: 'Barks to warn of zombies & pins lone threats',
-      position: new THREE.Vector3(-19, 0.6, 15),
+      position: new THREE.Vector3(-14, 0.6, 11),
       radius: 3.0,
       consumed: false,
     });
   }
 
-  private buildExtractionZone(pos: THREE.Vector3): THREE.PointLight {
-    // Armored Extraction Truck (represented by Ambulance/Truck + barrier + pulsing beacon)
-    const truck = this.assets.cloneModel('veh_ambulance');
-    truck.position.copy(pos);
-    truck.scale.setScalar(1.25);
-    this.scene.add(truck);
-    this.addStaticBox(pos.x, 1.4, pos.z, 3.2, 2.8, 6.4, truck);
+  private scatterDebris(): void {
+    const items: [string, number, number][] = [
+      ['prop_trashbag', -6.5, 15],
+      ['prop_trashbag2', -7.2, 15.8],
+      ['prop_trashbag', 15, 6.5],
+      ['prop_trashbag2', -36, -7],
+      ['prop_trashbag', 36, 15],
+      ['prop_trashbag2', 6.5, -15],
+      ['prop_wheels', 14, 7],
+      ['prop_wheels', -44, -20],
+      ['prop_wheel', -9, 6.3],
+      ['prop_wheel', 18, -7],
+      ['prop_pallet_broken', -12, 7],
+      ['prop_pallet_broken', 12, -9],
+      ['prop_cinder', -9, 9],
+      ['prop_cinder', 15, -7],
+      ['prop_chest', -17.6, 33.7],
+      ['prop_barrel', -40, 16],
+      ['prop_barrel', 40, -16],
+      ['prop_pipes', -44, 30],
+    ];
+    for (const [k, x, z] of items) {
+      const solid = k === 'prop_wheels' || k === 'prop_barrel' || k === 'prop_pipes';
+      this.placeModel(k, x, z, Math.random() * Math.PI * 2, solid);
+    }
+  }
 
-    const beaconMat = new THREE.MeshStandardMaterial({
-      color: 0xf59e0b,
-      emissive: 0xf59e0b,
-      emissiveIntensity: 3.0,
-    });
-    const beaconMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 0.45, 12), beaconMat);
-    beaconMesh.position.set(pos.x, 3.1, pos.z);
+  private buildExtractionZone(pos: THREE.Vector3): { light: THREE.PointLight; marker: ObjectiveMarker } {
+    const truck = this.assets.cloneModel('veh_truck_armored');
+    truck.position.copy(pos);
+    truck.scale.setScalar(1.15);
+    this.scene.add(truck);
+    const box = new THREE.Box3().setFromObject(truck);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    this.addStaticBox(center.x, center.y, center.z, size.x * 0.9, size.y, size.z * 0.9, truck, { occludes: true });
+
+    const beaconMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, emissive: 0xf59e0b, emissiveIntensity: 3.0 });
+    const beaconMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.3, 12), beaconMat);
+    beaconMesh.position.set(pos.x, box.max.y + 0.15, pos.z);
     this.scene.add(beaconMesh);
 
-    const beaconLight = new THREE.PointLight(0xf59e0b, 3.5, 24, 1.6);
-    beaconLight.position.set(pos.x, 3.5, pos.z);
+    const beaconLight = new THREE.PointLight(0xf59e0b, 3.5, 22, 1.6);
+    beaconLight.position.set(pos.x, box.max.y + 0.6, pos.z);
     this.scene.add(beaconLight);
+
+    this.placeModel('prop_barrier', pos.x - 4.5, pos.z + 4.5, 0.4, true);
+    this.placeModel('prop_barrier', pos.x + 4.5, pos.z + 4.5, -0.4, true);
+    this.placeModel('prop_cone', pos.x - 2.5, pos.z + 6, 0, false);
+    this.placeModel('prop_cone', pos.x + 2.5, pos.z + 6, 0, false);
+
+    const markerPos = pos.clone().add(new THREE.Vector3(0, 0, 4.4));
+    const marker = this.vfx.createObjectiveMarker(markerPos, 0x22c55e);
+    marker.setActive(false);
 
     this.interactables.push({
       id: 'extraction_truck',
       type: 'extraction_truck',
       label: 'Armored Extraction Truck',
       subLabel: 'Requires 3 Jerrycans + Radio Beacon',
-      position: pos.clone().add(new THREE.Vector3(0, 1, 3.5)),
+      position: markerPos.clone().setY(1),
       radius: 4.0,
     });
-
-    return beaconLight;
+    return { light: beaconLight, marker };
   }
 
   private placeModel(key: string, x: number, z: number, rotY: number, hasCollider: boolean): THREE.Group {
     const model = this.assets.cloneModel(key);
-    model.position.set(x, 0, z);
+    model.position.set(x, FLOOR_Y, z);
     model.rotation.y = rotY;
     this.scene.add(model);
-
     if (hasCollider) {
+      // Oriented box from the model's own (un-rotated) bounds
+      model.rotation.y = 0;
+      model.updateMatrixWorld(true);
       const box = new THREE.Box3().setFromObject(model);
-      const size = new THREE.Vector3();
-      const center = new THREE.Vector3();
-      box.getSize(size);
-      box.getCenter(center);
-      this.addStaticBox(
-        center.x,
-        center.y,
-        center.z,
-        Math.max(0.6, size.x * 0.85),
-        Math.max(0.8, size.y),
-        Math.max(0.6, size.z * 0.85),
-        model
-      );
-    } else {
-      this.raycastTargets.push(model);
+      model.rotation.y = rotY;
+      model.updateMatrixWorld(true);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      const body = new CANNON.Body({
+        mass: 0,
+        shape: new CANNON.Box(
+          new CANNON.Vec3(Math.max(0.2, size.x * 0.46), Math.max(0.3, size.y * 0.5), Math.max(0.2, size.z * 0.46))
+        ),
+        position: new CANNON.Vec3(x, center.y, z),
+      });
+      body.quaternion.setFromEuler(0, rotY, 0);
+      this.physicsWorld.addBody(body);
+      if (size.y > 2.2) this.cameraOccluders.push(model);
     }
+    this.raycastTargets.push(model);
     return model;
   }
 
   private placeVehicle(key: string, x: number, z: number, rotY: number): void {
-    const veh = this.assets.cloneModel(key);
-    veh.position.set(x, 0, z);
-    veh.rotation.y = rotY;
-    this.scene.add(veh);
-
-    const box = new THREE.Box3().setFromObject(veh);
-    const size = new THREE.Vector3();
-    const center = new THREE.Vector3();
-    box.getSize(size);
-    box.getCenter(center);
-
-    // Axis-aligned approximation for physics; tight enough for urban cover
-    this.addStaticBox(center.x, center.y, center.z, size.x * 0.85, size.y, size.z * 0.85, veh);
+    const veh = this.placeModel(key, x, z, rotY, true);
+    veh.position.y = 0.02;
+    veh.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const m of mats) {
+        // Wrecks: dead headlights / brake lights
+        if (m instanceof THREE.MeshStandardMaterial && /light/i.test(m.name)) m.emissiveIntensity = 0.2;
+      }
+    });
   }
 
   private placeBurningBarrel(x: number, z: number): void {
     this.placeModel('prop_barrel', x, z, Math.random() * 3, true);
-    const pos = new THREE.Vector3(x, 1.05, z);
-    this.vfx.registerFireEmitter(pos, 1.15);
-
-    const light = new THREE.PointLight(0xff6b1a, 2.8, 16, 1.8);
-    light.position.set(x, 1.6, z);
+    this.vfx.registerFireEmitter(new THREE.Vector3(x, FLOOR_Y + 1.12, z), 1.1);
+    const light = new THREE.PointLight(0xff6b1a, 2.8, 15, 1.8);
+    light.position.set(x, 1.7, z);
     this.scene.add(light);
     this.burningBarrels.push({ light, baseIntensity: 2.8, phase: Math.random() * 10 });
   }
 
+  // ───────────────────────────── Pickups ─────────────────────────────
+
   private spawnLootCrate(id: string, x: number, z: number, itemId: string): void {
     const crate = this.assets.cloneModel('prop_chest_special');
-    crate.position.set(x, 0.18, z);
+    crate.position.set(x, FLOOR_Y, z);
     crate.rotation.y = Math.random() * Math.PI;
     this.scene.add(crate);
+    this.raycastTargets.push(crate);
+
+    const marker = this.vfx.createObjectiveMarker(new THREE.Vector3(x, FLOOR_Y, z), 0xfbbf24);
+    marker.group.scale.set(0.55, 0.3, 0.55);
 
     this.interactables.push({
       id,
       type: 'loot',
       label: 'Supply Crate',
-      subLabel: 'Press [E] to Scavenge',
+      subLabel: 'Scavenge',
       position: new THREE.Vector3(x, 0.6, z),
-      radius: 2.5,
+      radius: 2.4,
       consumed: false,
       mesh: crate,
-      data: { itemId },
+      data: { itemId, marker },
     });
   }
 
-  private spawnJerrycan(id: string, x: number, z: number): void {
-    const can = this.assets.cloneModel('surv_gascan');
-    can.position.set(x, 0.18, z);
-    this.scene.add(can);
+  private makeJerrycan(): THREE.Group {
+    const g = new THREE.Group();
+    const red = new THREE.MeshStandardMaterial({ color: 0xb91c1c, roughness: 0.45, metalness: 0.3 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.44, 0.16), red);
+    body.position.y = 0.22;
+    g.add(body);
+    const handle = new THREE.Mesh(new THREE.TorusGeometry(0.07, 0.018, 6, 12, Math.PI), this.metalMat);
+    handle.position.set(-0.05, 0.44, 0);
+    g.add(handle);
+    const spout = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.03, 0.12, 8), this.metalMat);
+    spout.position.set(0.12, 0.48, 0);
+    spout.rotation.z = -0.5;
+    g.add(spout);
+    g.traverse((o) => (o.castShadow = true));
+    return g;
+  }
 
-    const glow = new THREE.PointLight(0xef4444, 1.4, 5);
-    glow.position.set(x, 0.8, z);
-    this.scene.add(glow);
+  private spawnJerrycan(id: string, x: number, z: number): void {
+    const can = this.makeJerrycan();
+    can.position.set(x, FLOOR_Y, z);
+    can.rotation.y = Math.random() * Math.PI;
+    this.scene.add(can);
+    const marker = this.vfx.createObjectiveMarker(new THREE.Vector3(x, FLOOR_Y, z), 0xef4444);
 
     this.interactables.push({
       id,
       type: 'jerrycan',
       label: 'Fuel Jerrycan',
-      subLabel: 'Extraction Objective [E]',
+      subLabel: 'Extraction objective',
       position: new THREE.Vector3(x, 0.6, z),
-      radius: 2.5,
+      radius: 2.4,
       consumed: false,
       mesh: can,
-      data: { glow },
+      data: { marker },
     });
   }
 
-  private spawnRadioBeacon(id: string, x: number, z: number): void {
-    const radio = this.assets.cloneModel('surv_radio');
-    radio.position.set(x, 1.0, z);
-    this.scene.add(radio);
+  private makeRadio(): THREE.Group {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(0.5, 0.3, 0.22),
+      new THREE.MeshStandardMaterial({ color: 0x3f4a36, roughness: 0.7 })
+    );
+    body.position.y = 0.15;
+    g.add(body);
+    const dial = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.2, 0.08),
+      new THREE.MeshStandardMaterial({ color: 0x111111, emissive: 0x38bdf8, emissiveIntensity: 1.5 })
+    );
+    dial.position.set(-0.08, 0.2, 0.111);
+    g.add(dial);
+    const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.6, 4), this.metalMat);
+    antenna.position.set(0.18, 0.6, 0);
+    antenna.rotation.z = -0.25;
+    g.add(antenna);
+    g.traverse((o) => (o.castShadow = true));
+    return g;
+  }
 
-    const glow = new THREE.PointLight(0x38bdf8, 1.6, 5);
-    glow.position.set(x, 1.4, z);
-    this.scene.add(glow);
+  private spawnRadioBeacon(id: string, x: number, z: number): void {
+    const radio = this.makeRadio();
+    radio.position.set(x, FLOOR_Y + 1.01, z);
+    radio.rotation.y = -Math.PI / 2;
+    this.scene.add(radio);
+    const marker = this.vfx.createObjectiveMarker(new THREE.Vector3(x, 1.0, z), 0x38bdf8);
 
     this.interactables.push({
       id,
       type: 'beacon',
       label: 'Radio Beacon Parts',
-      subLabel: 'Extraction Objective [E]',
+      subLabel: 'Extraction objective',
       position: new THREE.Vector3(x, 1.0, z),
-      radius: 2.5,
+      radius: 2.4,
       consumed: false,
       mesh: radio,
-      data: { glow },
+      data: { marker },
     });
   }
 
-  public placeBarricade(interactable: InteractableObject): void {
-    if (interactable.consumed) return;
-    interactable.consumed = true;
-
-    const pallet = this.assets.cloneModel('prop_pallet');
-    pallet.position.set(interactable.position.x, 0, interactable.position.z);
-    const horizontal = Boolean(interactable.data?.horizontal);
-    if (!horizontal) {
-      pallet.rotation.y = Math.PI / 2;
+  /** Builds a pallet barricade across a doorway. Returns the parts so the caller can tear it down. */
+  public static buildBarricade(
+    scene: THREE.Scene,
+    physicsWorld: CANNON.World,
+    assets: AssetManager,
+    item: InteractableObject
+  ): { mesh: THREE.Group; body: CANNON.Body } {
+    const horizontal = Boolean(item.data?.horizontal);
+    const mesh = new THREE.Group();
+    // Kit pallets stood on edge, three across the 3 m doorway, two high
+    for (let row = 0; row < 2; row++) {
+      for (let i = -1; i <= 1; i++) {
+        const pallet = assets.cloneModel('prop_pallet');
+        pallet.rotation.set(Math.PI / 2, 0, (Math.random() - 0.5) * 0.08);
+        pallet.position.set(i * 0.92, 0.6 + row * 1.15, (row - 0.5) * 0.12);
+        mesh.add(pallet);
+      }
     }
-    pallet.scale.set(2.2, 1.6, 1.2);
-    this.scene.add(pallet);
+    mesh.position.set(item.position.x, FLOOR_Y, item.position.z);
+    if (!horizontal) mesh.rotation.y = Math.PI / 2;
+    scene.add(mesh);
 
     const sx = horizontal ? 3.0 : 0.6;
     const sz = horizontal ? 0.6 : 3.0;
-    const body = this.addStaticBox(interactable.position.x, 1.0, interactable.position.z, sx, 2.0, sz, pallet);
-    this.barricadeBodies.set(interactable.id, body);
+    const body = new CANNON.Body({
+      mass: 0,
+      shape: new CANNON.Box(new CANNON.Vec3(sx * 0.5, 1.2, sz * 0.5)),
+      position: new CANNON.Vec3(item.position.x, 1.2, item.position.z),
+    });
+    physicsWorld.addBody(body);
+    return { mesh, body };
   }
 }

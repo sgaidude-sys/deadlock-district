@@ -65,6 +65,24 @@ export interface InteractableObject {
   data?: Record<string, unknown>;
 }
 
+export interface WaypointState {
+  label: string;
+  distance: number;
+  /** Screen position in pixels (clamped to the screen edge when off-screen). */
+  x: number;
+  y: number;
+  onScreen: boolean;
+  /** Arrow rotation (radians) when off-screen. */
+  angle: number;
+  color: string;
+}
+
+export interface DamageIndicator {
+  /** Direction relative to the camera (radians, 0 = in front). */
+  angle: number;
+  alpha: number;
+}
+
 export interface HUDState {
   health: number;
   maxHealth: number;
@@ -100,5 +118,11 @@ export interface HUDState {
   toastMessage: string | null;
   crosshairSpread: number;
   hitMarkerTimer: number;
+  hitKind: 'hit' | 'head' | 'kill';
   damageFlashTimer: number;
+  inventoryVersion: number;
+  waypoint: WaypointState | null;
+  damageIndicators: DamageIndicator[];
+  extractionInRange: boolean;
+  isSprinting: boolean;
 }

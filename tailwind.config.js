@@ -9,7 +9,6 @@ export default {
       },
       colors: {
         blood: '#dc2626',
-        amber: '#f59e0b',
         toxic: '#84cc16',
       },
     },
