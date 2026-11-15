@@ -1,0 +1,18 @@
+node_modules
+dist
+.DS_Store
+*.zip
+# Raw source asset packs in root (runtime assets are curated in /public/assets/)
+800-game-sound-effects/
+Animated Zombie Pack/
+brackeys_vfx_bundle/
+Downtown City MegaKit*/
+JDSherbert - Ambiences Music Pack*/
+Modular Streets Pack/
+Public Transport Pack/
+Survival Pack/
+Ultimate Food Pack/
+Ultimate Guns Pack/
+Ultimate House Interior Pack/
+Ultimate Stylized Nature Pack/
+Zombie Apocalypse Kit/
