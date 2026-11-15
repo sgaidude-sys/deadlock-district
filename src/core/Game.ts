@@ -47,6 +47,7 @@ export class Game {
   private gameOver = false;
   private inventoryOpen = false;
   private hitStopTimer = 0;
+  private spawnGraceTimer = 4.0;
   private hitMarkerTimer = 0;
   private damageFlashTimer = 0;
   private toastMessage: string | null = null;
@@ -188,7 +189,7 @@ export class Game {
   }
 
   private startGame(survivorId: SurvivorId): void {
-    const spawnPos = new THREE.Vector3(-22, 0, 18); // Near Safehouse
+    const spawnPos = new THREE.Vector3(-12, 0, 14); // Open avenue near Safehouse & Dog
     this.player = new PlayerController(
       survivorId,
       spawnPos,
@@ -448,6 +449,7 @@ export class Game {
     }
 
     // Timers
+    this.spawnGraceTimer = Math.max(0, this.spawnGraceTimer - dt);
     this.hitMarkerTimer = Math.max(0, this.hitMarkerTimer - dt);
     this.damageFlashTimer = Math.max(0, this.damageFlashTimer - dt);
     if (this.toastTimer > 0) {
@@ -473,7 +475,7 @@ export class Game {
       this.dayNight.isNight(),
       this.extractionActive,
       (dmg) => {
-        if (!this.player || this.gameOver) return;
+        if (!this.player || this.gameOver || this.spawnGraceTimer > 0) return;
         this.player.takeDamage(dmg);
         this.damageFlashTimer = 0.25;
         if (this.player.health <= 0) {

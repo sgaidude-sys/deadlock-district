@@ -156,8 +156,8 @@ export class PlayerController {
     this.group.add(this.volumetricCone);
 
     this.equipWeapon('pistol');
-    this.currentCamPos.copy(spawnPos).add(new THREE.Vector3(0, 2.4, -4));
-    this.currentLookAt.copy(spawnPos).add(new THREE.Vector3(0, 1.4, 2));
+    this.currentCamPos.copy(spawnPos).add(new THREE.Vector3(0.72, 2.0, 4.2));
+    this.currentLookAt.copy(spawnPos).add(new THREE.Vector3(0.36, 1.5, -6));
   }
 
   public setOnShotHit(cb: ShotHitCallback): void {

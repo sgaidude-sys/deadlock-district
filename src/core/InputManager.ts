@@ -20,8 +20,15 @@ export class InputManager {
   }
 
   public requestPointerLock(): void {
-    if (document.pointerLockElement !== this.domElement) {
-      this.domElement.requestPointerLock?.();
+    try {
+      if (document.pointerLockElement !== this.domElement) {
+        const res = this.domElement.requestPointerLock?.() as unknown as Promise<void> | undefined;
+        if (res && typeof res.catch === 'function') {
+          res.catch(() => {});
+        }
+      }
+    } catch {
+      // Ignore pointer lock errors in restricted iframes/headless browsers
     }
   }
 
