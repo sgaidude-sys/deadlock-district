@@ -696,7 +696,7 @@ export class ZombieManager {
   private syncTransform(z: ZombieInstance, _dt: number): void {
     z.body.position.y = z.radius;
     z.body.velocity.y = 0;
-    z.group.position.set(z.body.position.x, 0.06, z.body.position.z);
+    z.group.position.set(z.body.interpolatedPosition.x, 0.06, z.body.interpolatedPosition.z);
     z.group.rotation.set(0, z.facing, 0);
   }
 }

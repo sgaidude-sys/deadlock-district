@@ -222,8 +222,14 @@ export class PlayerController {
     this.facing = yaw;
   }
 
+  /**
+   * Smoothed position: physics runs at a fixed 60 Hz, so the raw body position only changes on
+   * physics ticks (stutter at 120/144 Hz and with uneven frame times). The interpolated position
+   * is updated every rendered frame.
+   */
   public getPosition(): THREE.Vector3 {
-    return new THREE.Vector3(this.body.position.x, 0, this.body.position.z);
+    const p = this.body.interpolatedPosition;
+    return new THREE.Vector3(p.x, 0, p.z);
   }
 
   /** Direction the character's body faces. */
@@ -449,7 +455,8 @@ export class PlayerController {
 
     this.body.position.y = BODY_RADIUS;
     this.body.velocity.y = 0;
-    this.group.position.set(this.body.position.x, 0.06, this.body.position.z);
+    const smooth = this.body.interpolatedPosition;
+    this.group.position.set(smooth.x, 0.06, smooth.z);
     // Kit models face +Z, so add PI to face along -Z when facing = 0
     this.group.rotation.y = this.facing + Math.PI;
 
@@ -616,11 +623,10 @@ export class PlayerController {
     const desired = pivot.clone().addScaledVector(boomDir, this.camDistance);
     desired.y = Math.max(0.35, desired.y);
 
-    // Light positional smoothing only (rotation is 1:1 with the mouse, so aiming feels direct)
-    this.currentCamPos.lerp(desired, Math.min(1, dt * 25));
-    if (this.currentCamPos.distanceTo(pivot) > this.camDistance + 0.05) {
-      this.currentCamPos.copy(pivot).add(this.currentCamPos.clone().sub(pivot).setLength(this.camDistance));
-    }
+    // The camera sits rigidly on its boom. The pivot follows the (interpolated, already smooth)
+    // player position and rotation is 1:1 with the mouse, so no extra position smoothing is needed;
+    // only the boom length eases (in when blocked, out when clear).
+    this.currentCamPos.copy(desired);
 
     const shake = this.trauma * this.trauma * 0.12;
     const t = performance.now() * 0.001;
