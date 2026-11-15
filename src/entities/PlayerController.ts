@@ -115,37 +115,49 @@ export class PlayerController {
     // Load survivor model
     const modelKey = `survivor_${survivorId}`;
     this.modelGroup = this.assets.cloneModel(modelKey);
+
+    // Hide all baked-in weapons from Zombie Apocalypse Kit character rig
+    const bakedWeaponNames = new Set([
+      'Axe',
+      'Guitar',
+      'Knife',
+      'Pistol',
+      'Rifle',
+      'Shotgun',
+      'SMG',
+      'Spear',
+      'WoodenBat_Barbed',
+      'WoodenBat_Saw',
+    ]);
+    this.modelGroup.traverse((child) => {
+      if (bakedWeaponNames.has(child.name)) {
+        child.visible = false;
+      }
+    });
+
     this.group.add(this.modelGroup);
     this.scene.add(this.group);
 
-    // Weapon socket on right side
-    this.weaponSocket.position.set(0.32, 1.25, 0.35);
+    // Weapon socket on right hand side
+    this.weaponSocket.position.set(-0.34, 1.18, 0.42);
     this.group.add(this.weaponSocket);
 
-    // Setup animations
+    // Setup animations (exact clip name matching so Jump_Idle doesn't overwrite Idle)
     const clips = this.assets.getClips(modelKey);
     if (clips.length > 0) {
       this.mixer = new THREE.AnimationMixer(this.modelGroup);
       for (const clip of clips) {
-        const lower = clip.name.toLowerCase();
         const action = this.mixer.clipAction(clip);
-        if (lower.includes('idle')) this.actions['idle'] = action;
-        else if (lower.includes('run')) this.actions['run'] = action;
-        else if (lower.includes('walk')) this.actions['walk'] = action;
-        else if (lower.includes('shoot') || lower.includes('punch') || lower.includes('attack')) {
-          this.actions['attack'] = action;
-        } else if (lower.includes('hit')) {
-          this.actions['hit'] = action;
-        }
+        this.actions[clip.name] = action;
       }
-      this.playAnim('idle');
+      this.playAnim('Idle_Gun');
     }
 
     // Flashlight + volumetric cone
     this.flashlight = new THREE.SpotLight(0xfff5db, 5.5, 38, Math.PI / 5.5, 0.48, 1.4);
     this.flashlight.castShadow = true;
     this.flashlight.shadow.mapSize.set(512, 512);
-    this.flashlight.position.set(0.25, 1.38, 0.3);
+    this.flashlight.position.set(-0.22, 1.35, 0.35);
     this.group.add(this.flashlight);
     this.group.add(this.flashlightTarget);
     this.flashlightTarget.position.set(0, 1.2, 10);
@@ -218,7 +230,7 @@ export class PlayerController {
   public takeDamage(amount: number): void {
     this.health = Math.max(0, this.health - amount);
     this.trauma = Math.min(1, this.trauma + 0.45);
-    this.playAnim('hit', true);
+    this.playAnim('HitReact', true);
   }
 
   public addTrauma(amount: number): void {
@@ -227,7 +239,7 @@ export class PlayerController {
 
   private playAnim(name: string, oneShot = false): void {
     if (!this.mixer) return;
-    const target = this.actions[name] ?? this.actions['walk'] ?? this.actions['idle'];
+    const target = this.actions[name] ?? this.actions['Idle_Gun'] ?? this.actions['Idle'] ?? this.actions['Walk'];
     if (!target) return;
     if (this.currentAnim === name && !oneShot) return;
 
@@ -275,13 +287,21 @@ export class PlayerController {
       }
     }
 
-    // Mouse look
+    // Mouse look + Arrow key fallback
     if (!inventoryOpen && this.input.isPointerLocked) {
       const { dx, dy } = this.input.consumeMouseDelta();
       this.yaw -= dx;
       this.pitch = THREE.MathUtils.clamp(this.pitch - dy, -0.75, 0.65);
     } else {
       this.input.consumeMouseDelta();
+    }
+
+    if (!inventoryOpen) {
+      const keyLookSpeed = 2.2 * dt;
+      if (this.input.isDown('ArrowLeft')) this.yaw += keyLookSpeed;
+      if (this.input.isDown('ArrowRight')) this.yaw -= keyLookSpeed;
+      if (this.input.isDown('ArrowUp')) this.pitch = Math.min(0.65, this.pitch + keyLookSpeed * 0.7);
+      if (this.input.isDown('ArrowDown')) this.pitch = Math.max(-0.75, this.pitch - keyLookSpeed * 0.7);
     }
 
     this.isAiming = !inventoryOpen && this.input.rightMouseDown;
@@ -313,16 +333,17 @@ export class PlayerController {
     else if (this.isCrouching) speed = 3.1;
     else if (this.isAiming) speed = 3.8;
 
+    const holdingGun = !this.equippedWeapon.isMelee;
     if (isMoving) {
       moveDir.normalize();
       this.body.velocity.x = moveDir.x * speed;
       this.body.velocity.z = moveDir.z * speed;
 
       if (isSprinting) {
-        this.playAnim('run');
+        this.playAnim(holdingGun ? 'Run_Gun' : 'Run');
         this.noiseLevel = Math.max(this.noiseLevel, 30);
       } else {
-        this.playAnim('walk');
+        this.playAnim(holdingGun ? 'Walk_Gun' : 'Walk');
         this.noiseLevel = Math.max(this.noiseLevel, this.isCrouching ? 5 : 14);
       }
 
@@ -335,7 +356,7 @@ export class PlayerController {
     } else {
       this.body.velocity.x *= 0.72;
       this.body.velocity.z *= 0.72;
-      this.playAnim('idle');
+      this.playAnim(this.isCrouching ? 'Duck' : holdingGun ? 'Idle_Gun' : 'Idle');
     }
 
     // Keep player grounded
@@ -386,7 +407,9 @@ export class PlayerController {
     }
 
     this.fireCooldown = 1 / w.fireRate;
-    this.playAnim('attack', true);
+    if (w.isMelee) {
+      this.playAnim('Slash', true);
+    }
     this.addTrauma(w.trauma);
     this.noiseLevel = Math.max(this.noiseLevel, Math.min(100, w.noiseRadius * 1.4));
 

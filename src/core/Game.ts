@@ -127,6 +127,7 @@ export class Game {
     this.audio = new AudioManager(this.assets, this.scene);
     this.audio.attachToCamera(this.camera);
     this.input = new InputManager(this.renderer.domElement);
+    this.input.setCanLockChecker(() => this.running && !this.inventoryOpen && !this.gameOver);
     this.vfx = new VFXManager(this.scene, this.assets);
     this.inventory = new InventorySystem(this.audio);
 

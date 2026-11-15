@@ -8,6 +8,7 @@ export class InputManager {
   public sensitivity = 0.0022;
 
   private onKeyPressCallbacks = new Map<string, Array<() => void>>();
+  private canLockChecker?: () => boolean;
 
   constructor(private domElement: HTMLElement) {
     window.addEventListener('keydown', this.handleKeyDown);
@@ -17,6 +18,15 @@ export class InputManager {
     window.addEventListener('mouseup', this.handleMouseUp);
     window.addEventListener('contextmenu', (e) => e.preventDefault());
     document.addEventListener('pointerlockchange', this.handlePointerLockChange);
+    this.domElement.addEventListener('click', () => {
+      if (!this.isPointerLocked && (!this.canLockChecker || this.canLockChecker())) {
+        this.requestPointerLock();
+      }
+    });
+  }
+
+  public setCanLockChecker(fn: () => boolean): void {
+    this.canLockChecker = fn;
   }
 
   public requestPointerLock(): void {
