@@ -87,31 +87,33 @@ export class ZombieManager {
     this.idCounter++;
     const id = `zombie_${this.idCounter}`;
 
-    let modelKey = 'zombie_basic';
+    const modelKey = 'zombie_animated';
     let hp = 85;
     let speed = 2.3;
     let damage = 14;
     let radius = 0.45;
     let scaleMod = 1.0;
+    let tintHex = 0xdbe6d8;
 
     if (archetype === 'sprinter') {
-      modelKey = 'zombie_animated';
       hp = 65;
       speed = 5.1;
       damage = 16;
+      scaleMod = 0.96;
+      tintHex = 0xffb8b8;
     } else if (archetype === 'brute') {
-      modelKey = 'zombie_chubby';
       hp = 240;
       speed = 1.9;
       damage = 28;
       radius = 0.68;
-      scaleMod = 1.15;
+      scaleMod = 1.38;
+      tintHex = 0xb87474;
     } else if (archetype === 'crawler') {
-      modelKey = 'zombie_ribcage';
       hp = 55;
       speed = 3.4;
       damage = 12;
-      scaleMod = 0.88;
+      scaleMod = 0.85;
+      tintHex = 0x9aa8b8;
     }
 
     const group = this.assets.cloneModel(modelKey);
@@ -129,11 +131,17 @@ export class ZombieManager {
       o.userData.zombieId = id;
       if ((o as THREE.Mesh).isMesh) {
         const m = o as THREE.Mesh;
-        // Clone material so hit-flash only affects this zombie
+        // Clone material so hit-flash and archetype tint only affect this zombie
         if (m.material) {
           m.material = Array.isArray(m.material)
             ? m.material.map((mm) => mm.clone())
             : m.material.clone();
+          const mats = Array.isArray(m.material) ? m.material : [m.material];
+          for (const mat of mats) {
+            if (mat instanceof THREE.MeshStandardMaterial) {
+              mat.color.setHex(tintHex);
+            }
+          }
         }
         meshes.push(m);
       }
