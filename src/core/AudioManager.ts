@@ -586,6 +586,31 @@ export class AudioManager {
     }
   }
 
+  /** Squelch + crackle that opens each radio transmission. */
+  public playRadioStatic(): void {
+    if (this.muted) return;
+    const t = this.ctx.currentTime;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const band = this.ctx.createBiquadFilter();
+    band.type = 'bandpass';
+    band.frequency.value = 1900;
+    band.Q.value = 0.9;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.16, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.32);
+    src.connect(band).connect(g).connect(this.sfxBus);
+    src.start(t, Math.random());
+    src.stop(t + 0.35);
+    src.onended = () => {
+      src.disconnect();
+      band.disconnect();
+      g.disconnect();
+    };
+    this.playUI('switch', 0.3, 1.3);
+  }
+
   public playDryFire(): void {
     this.playUI('gun_empty', 0.5, 1 + Math.random() * 0.1);
   }

@@ -10,12 +10,14 @@ import { AssetManager } from './AssetManager';
 import { AudioManager, LoopHandle } from './AudioManager';
 import { InputManager } from './InputManager';
 import { VFXManager, ObjectiveMarker } from './VFXManager';
-import { BarricadeInstance, CityGenerator, CityWorldData, ExplosiveBarrel, VehicleInstance } from '../world/CityGenerator';
+import { CityGenerator, CityWorldData, ExplosiveBarrel, FLOOR_Y, VehicleInstance } from '../world/CityGenerator';
 import { PlayerController } from '../entities/PlayerController';
 import { ZombieManager } from '../entities/ZombieManager';
 import { DogCompanion } from '../entities/DogCompanion';
 import { DayNightSystem } from '../systems/DayNightSystem';
 import { WeatherSystem } from '../systems/WeatherSystem';
+import { FortificationSystem } from '../systems/FortificationSystem';
+import { StoryDirector } from '../systems/StoryDirector';
 import { InventorySystem } from '../systems/InventorySystem';
 import { HUD } from '../ui/HUD';
 import { DamageIndicator, InteractableObject, SurvivorId, WaypointState, WeaponId } from '../types/game';
@@ -94,7 +96,15 @@ export class Game {
   private pendingDetonations: { barrel: ExplosiveBarrel; t: number }[] = [];
   private lastImpactSound = 0;
   private inventory: InventorySystem;
-  private barricades: BarricadeInstance[] = [];
+  private fort: FortificationSystem | null = null;
+  private story: StoryDirector | null = null;
+  private hasKeys = false;
+  private keysPos: THREE.Vector3 | null = null;
+  private siegeDone = false;
+  private gateOpen = 0;
+  private resting: { lastPhase: string } | null = null;
+  private ending: { t: number; truckSpeed: number; boarded: boolean } | null = null;
+  private lastPos = new THREE.Vector3();
 
   private sunLight: THREE.DirectionalLight;
   private hemiLight: THREE.HemisphereLight;
@@ -311,12 +321,14 @@ export class Game {
       if (!this.running) return;
       this.audio.playSiren();
       if (Math.random() < 0.5) this.weather.forceRain();
+      this.story?.notify('nightfall');
       this.showToast('THE BLOOD SIREN WAILS — nightfall. Sprinters & Brutes are hunting.', 5);
     });
     this.dayNight.onDawn(() => {
       if (!this.running) return;
       this.audio.playObjectiveChime();
       this.showToast(`Dawn breaks. You survived night ${this.dayNight!.dayNumber - 1}.`, 4);
+      this.story?.notify('dawn');
     });
 
     // Warm the shader cache so the first frame of gameplay doesn't hitch
@@ -355,7 +367,33 @@ export class Game {
       this.worldData.sightBlockers,
       spawnPos
     );
-    this.zombieManager.setBarricades(this.barricades, (b) => this.breakBarricade(b));
+    this.fort = new FortificationSystem(
+      this.scene,
+      this.physicsWorld,
+      this.assets,
+      this.audio,
+      this.worldData.entries,
+      this.worldData.buildings,
+      this.worldData.interactables,
+      this.worldData.raycastTargets
+    );
+    const fort = this.fort;
+    this.zombieManager.setRouter(
+      (from, to) => fort.route(from, to),
+      (b) => {
+        const slot = fort.slotForBarricade(b);
+        if (!slot) return;
+        fort.destroy(slot);
+        const inside = this.player && fort.buildingAt(this.player.getPosition())?.id === slot.entry.building;
+        this.showToast(inside ? `They broke through the ${slot.entry.kind}!` : `A barricade at the ${slot.entry.building} gave way.`, 3);
+      }
+    );
+    this.zombieManager.setOnBossKilled((pos) => {
+      this.spawnKeys(pos);
+      this.story?.notify('bossKilled');
+      this.showToast('The Butcher is down!', 3);
+    });
+    this.story = this.createStory();
 
     this.dog = new DogCompanion(this.worldData.dogSpawnPosition, this.scene, this.assets, this.audio);
 
@@ -381,7 +419,7 @@ export class Game {
       const now = performance.now();
       if (now - this.lastImpactSound > 50) {
         this.lastImpactSound = now;
-        const isBarricade = this.barricades.some((b) => Game.isDescendant(obj, b.mesh));
+        const isBarricade = (this.fort?.slots ?? []).some((sl) => sl.visual && Game.isDescendant(obj, sl.visual));
         this.audio.playPositional(vehicleId ? 'impact_metal' : isBarricade ? 'impact_wood' : 'impact_concrete', point, 0.45, 0.15, 4);
       }
       if (vehicleId) {
@@ -406,7 +444,7 @@ export class Game {
     this.audio.createJukebox(this.worldData.jukeboxPosition);
     this.input.requestPointerLock();
     this.running = true;
-    this.showToast('Find 3 Jerrycans + the Radio Beacon. Gunfire attracts the dead.', 5);
+    this.story.begin();
   }
 
   /**
@@ -445,6 +483,19 @@ export class Game {
     this.renderer.setRenderTarget(this.composer.readBuffer);
     this.renderer.compile(this.scene, this.camera);
     this.renderer.setRenderTarget(prev);
+    // Shadow-depth variants are only built for things inside the shadow frustum, which follows
+    // the player. Widen it to the whole district for one frame so none compile mid-game.
+    const cam = this.sunLight.shadow.camera;
+    const saved = [cam.left, cam.right, cam.top, cam.bottom];
+    cam.left = cam.bottom = -95;
+    cam.right = cam.top = 95;
+    cam.updateProjectionMatrix();
+    this.sunLight.target.position.set(0, 0, 0);
+    this.sunLight.position.set(40, 70, 30);
+    this.sunLight.target.updateMatrixWorld();
+    this.composer.render();
+    [cam.left, cam.right, cam.top, cam.bottom] = saved;
+    cam.updateProjectionMatrix();
     this.composer.render();
   }
 
@@ -473,7 +524,7 @@ export class Game {
   }
 
   private bindHotkeys(): void {
-    const active = () => this.running && !this.inventoryOpen && !this.paused && !this.gameOver;
+    const active = () => this.running && !this.inventoryOpen && !this.paused && !this.gameOver && !this.resting && !this.ending;
     this.input.onKeyPress('KeyF', () => active() && this.player?.toggleFlashlight());
     this.input.onKeyPress('KeyV', () => active() && this.player?.swapShoulder());
     this.input.onKeyPress('KeyC', () => active() && this.player?.toggleCrouch());
@@ -506,6 +557,15 @@ export class Game {
     });
     this.input.onKeyPress('KeyP', togglePause);
     this.input.onKeyPress('KeyE', () => active() && this.handleInteract());
+    this.input.onKeyPress('KeyG', () => {
+      if (!active() || !this.player || !this.fort) return;
+      const item = this.getNearbyInteractable();
+      const slot = item && this.fort.slotFor(item);
+      if (!slot) return;
+      const msg = this.fort.secondary(slot, this.player);
+      if (msg.startsWith('Need') || msg.startsWith('Already')) this.audio.playUI('ui_error', 0.5);
+      this.showToast(msg);
+    });
 
     const slots: WeaponId[] = ['axe', 'pistol', 'shotgun', 'smg', 'rifle', 'sniper'];
     slots.forEach((id, i) => {
@@ -577,22 +637,37 @@ export class Game {
       } else {
         this.showToast(`${gotText} • +${scrapGain} Scrap`);
       }
+      if (item.id === 'crate_safehouse') this.story?.notify('lootedSafehouse');
     } else if (item.type === 'jerrycan') {
       this.collect(item);
       this.jerrycansCollected++;
       this.audio.playUI('loot_pickup', 0.7);
       this.audio.playObjectiveChime();
       this.showToast(`Fuel Jerrycan secured (${this.jerrycansCollected}/3)`);
-      this.checkExtractionReady();
+      this.story?.notify('jerrycan');
     } else if (item.type === 'beacon') {
       this.collect(item);
       this.beaconCollected = true;
       this.audio.playUI('loot_pickup', 0.7);
       this.audio.playObjectiveChime();
-      this.showToast('Radio Beacon parts acquired!');
-      this.checkExtractionReady();
-    } else if (item.type === 'barricade') {
-      this.toggleBarricade(item);
+      this.showToast('Shortwave radio — tuned to Evac Command.');
+      this.story?.notify('beacon');
+    } else if (item.type === 'entry') {
+      const slot = this.fort?.slotFor(item);
+      if (!slot) return;
+      const msg = this.fort!.primary(slot, this.player);
+      if (msg.startsWith('Need') || msg.startsWith('Already')) this.audio.playUI('ui_error', 0.5);
+      this.showToast(msg);
+    } else if (item.type === 'bed') {
+      this.startRest();
+    } else if (item.type === 'keys') {
+      this.collect(item);
+      this.hasKeys = true;
+      this.keysPos = null;
+      this.audio.playUI('objective_pickup', 0.7);
+      this.audio.playUI('crate_open', 0.4, 1.4);
+      this.showToast('Truck keys recovered.');
+      this.story?.notify('keys');
     } else if (item.type === 'campfire') {
       if (this.campfireCooldown > 0) {
         this.showToast(`The fire needs tending — rest again in ${Math.ceil(this.campfireCooldown)}s.`);
@@ -611,14 +686,16 @@ export class Game {
       this.dog?.recruit();
       this.showToast('Survivor dog recruited! It barks at threats and pins zombies.');
     } else if (item.type === 'extraction_truck') {
-      if (this.extractionActive) return;
-      if (this.jerrycansCollected < 3 || !this.beaconCollected) {
-        this.showToast(
-          `Need 3 Jerrycans (${this.jerrycansCollected}/3) & Radio Beacon (${this.beaconCollected ? '✓' : '✗'})`
-        );
+      if (this.story?.stage === 'board') {
+        this.startEnding();
         return;
       }
-      item.consumed = true;
+      if (this.extractionActive) return;
+      if (this.jerrycansCollected < 3 || !this.hasKeys) {
+        this.audio.playUI('ui_error', 0.5);
+        this.showToast(`The truck needs fuel (${this.jerrycansCollected}/3) and its keys (${this.hasKeys ? '✓' : '✗'}).`);
+        return;
+      }
       this.extractionActive = true;
       this.extractionTimer = SIEGE_SECONDS;
       this.audio.playUI('ui_alert', 0.9);
@@ -626,74 +703,10 @@ export class Game {
       this.engineLoop = this.audio.createLoop('loop_engine', this.worldData.extractionPosition.clone().setY(1), 0.7, 6);
       this.engineLoop.setRate(0.7);
       this.worldData.extractionBeaconLight.color.setHex(0xef4444);
-      this.showToast(`ENGINE PRIMING — hold the truck for ${SIEGE_SECONDS} seconds!`, 5);
+      item.label = 'Armored Extraction Truck';
+      item.subLabel = 'Engine warming up — defend it!';
+      this.story?.notify('truckStarted');
     }
-  }
-
-  private checkExtractionReady(): void {
-    if (this.jerrycansCollected >= 3 && this.beaconCollected) {
-      this.worldData.extractionMarker.setActive(true);
-      this.worldData.extractionBeaconLight.color.setHex(0x22c55e);
-      this.showToast('All parts found! Head to the armored truck at the North Gate.', 5);
-    }
-  }
-
-  private toggleBarricade(item: InteractableObject): void {
-    if (!this.player) return;
-    const existing = this.barricades.find((b) => b.interactable === item);
-    if (existing) {
-      this.removeBarricade(existing);
-      this.player.scrap += 5;
-      this.audio.playPositional('wood_break', item.position, 0.6);
-      this.showToast('Barricade dismantled (+5 Scrap).');
-      return;
-    }
-    if (this.player.scrap < 10) {
-      this.showToast('Need 10 Scrap to barricade this doorway.');
-      return;
-    }
-    // Don't trap the player (or wedge them inside the collider)
-    if (this.player.getPosition().distanceTo(item.position.clone().setY(0)) < 1.1) {
-      this.showToast('Step out of the doorway first.');
-      return;
-    }
-    this.player.scrap -= 10;
-    const { mesh, body } = CityGenerator.buildBarricade(this.scene, this.physicsWorld, this.assets, item);
-    this.worldData.raycastTargets.push(mesh);
-    this.barricades.push({
-      id: item.id,
-      interactable: item,
-      mesh,
-      body,
-      position: item.position.clone().setY(0),
-      hp: 120,
-      maxHp: 120,
-    });
-    item.label = 'Remove Barricade';
-    item.subLabel = 'Refunds 5 Scrap';
-    this.audio.playPositional('wood_break', item.position, 0.7, 0.05);
-    this.showToast('Doorway barricaded — zombies will have to break through.');
-  }
-
-  private removeBarricade(b: BarricadeInstance): void {
-    this.scene.remove(b.mesh);
-    this.physicsWorld.removeBody(b.body);
-    const idx = this.worldData.raycastTargets.indexOf(b.mesh);
-    if (idx >= 0) this.worldData.raycastTargets.splice(idx, 1);
-    this.barricades.splice(this.barricades.indexOf(b), 1);
-    b.interactable.label = b.interactable.id.replace('barricade_', 'Barricade ') + ' Door';
-    b.interactable.subLabel = 'Costs 10 Scrap • Zombies can break it';
-  }
-
-  private breakBarricade(b: BarricadeInstance): void {
-    if (!this.barricades.includes(b)) return;
-    this.removeBarricade(b);
-    const debris = this.assets.cloneModel('prop_pallet_broken');
-    debris.position.copy(b.position).setY(0.04);
-    debris.rotation.y = Math.random() * Math.PI;
-    this.scene.add(debris);
-    this.audio.playPositional('wood_break', b.position, 1.0, 0.05);
-    this.showToast('A barricade has been smashed!');
   }
 
   private static findTag(obj: THREE.Object3D, key: string): string | undefined {
@@ -746,8 +759,8 @@ export class Game {
       }
       if (d < 12) this.hitStopTimer = 0.05;
     }
-    for (const b of this.barricades.slice()) {
-      if (b.position.distanceTo(pos) < 5) this.breakBarricade(b);
+    for (const slot of this.fort?.slots ?? []) {
+      if (slot.barricade && slot.entry.position.distanceTo(pos) < 5) this.fort!.destroy(slot);
     }
     for (const v of this.worldData.vehicles) {
       if (v.position.distanceTo(pos) < 9) this.triggerCarAlarm(v);
@@ -796,6 +809,270 @@ export class Game {
     }
   }
 
+  private createStory(): StoryDirector {
+    const world = this.worldData;
+    const story = new StoryDirector({
+      jerrycans: () => this.jerrycansCollected,
+      safehouseSeal: () => this.fort?.sealedCount('Safehouse') ?? [0, 3],
+      isNight: () => this.dayNight?.isNight() ?? false,
+      skipToDusk: () => {
+        // Dusk starts at 0.56 — land just inside it so the bed is usable straight away
+        if (!this.dayNight || this.dayNight.timeOfDay >= 0.575) return;
+        this.dayNight.timeOfDay = 0.575;
+        this.showToast('Hours pass while you siphon the fuel... the sun is going down.', 4.5);
+      },
+      spawnBoss: () => {
+        if (!this.zombieManager) return;
+        const boss = this.zombieManager.spawnZombie(world.bossSpawn, 'brute', {
+          scale: 1.9,
+          hp: 1000,
+          damage: 32,
+          speed: 2.5,
+          tint: 0xffa090,
+          boss: true,
+        });
+        boss.state = 'patrol';
+        this.audio.playPositional('brute_roar', world.bossSpawn, 1, 0.05, 25, 0.8, 0.7);
+      },
+      bossPosition: () => this.zombieManager?.getBoss()?.group.position.clone().setY(2.5) ?? null,
+      keysPosition: () => this.keysPos?.clone().setY(1) ?? null,
+      interactablePosition: (id) => {
+        const it = world.interactables.find((i) => i.id === id && !i.consumed);
+        return it ? it.position.clone().setY(1.2) : null;
+      },
+      nearestJerrycan: () => {
+        if (!this.player) return null;
+        const p = this.player.getPosition();
+        let best: THREE.Vector3 | null = null;
+        let bd = Infinity;
+        for (const it of world.interactables) {
+          if (it.type !== 'jerrycan' || it.consumed) continue;
+          const d = it.position.distanceTo(p);
+          if (d < bd) {
+            bd = d;
+            best = it.position.clone().setY(1.2);
+          }
+        }
+        return best;
+      },
+      safehouseDoor: () => {
+        const door = world.entries.find((e) => e.building === 'Safehouse' && e.kind === 'door')!;
+        return door.position.clone().setY(2);
+      },
+      truckPosition: () => world.extractionPosition.clone().setY(3),
+      siegeSecondsLeft: () => this.extractionTimer,
+      onStageChanged: (stage, chapter, title) => {
+        if (stage !== 'arrive') this.audio.playUI('ui_confirm', 0.5);
+        if (stage === 'board') this.audio.playUI('ui_powerup', 0.7);
+        this.showToast(`CHAPTER ${chapter} — ${title.toUpperCase()}`, 3);
+        const truck = world.interactables.find((i) => i.type === 'extraction_truck');
+        if (truck && (stage === 'truck' || stage === 'board')) {
+          world.extractionMarker.setActive(true);
+          world.extractionBeaconLight.color.setHex(0x22c55e);
+          truck.label = stage === 'board' ? 'BOARD THE TRUCK' : 'Start the armored truck';
+          truck.subLabel = stage === 'board' ? 'Get in and get out!' : 'Fuel 3/3 · Keys ✓';
+        }
+      },
+    });
+    story.setOnRadioLine(() => this.audio.playRadioStatic());
+    return story;
+  }
+
+  private spawnKeys(pos: THREE.Vector3): void {
+    const keys = new THREE.Group();
+    const gold = new THREE.MeshStandardMaterial({ color: 0xd4a72c, metalness: 0.9, roughness: 0.3, emissive: 0x3a2a00, emissiveIntensity: 0.6 });
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.09, 0.015, 8, 16), gold);
+    ring.rotation.x = Math.PI / 2;
+    keys.add(ring);
+    for (let i = 0; i < 2; i++) {
+      const k = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.01, 0.16), gold);
+      k.position.set(0.05 - i * 0.1, 0, 0.13);
+      k.rotation.y = 0.3 - i * 0.6;
+      keys.add(k);
+    }
+    const spot = pos.clone().setY(FLOOR_Y + 0.02);
+    keys.position.copy(spot);
+    this.scene.add(keys);
+    const marker = this.vfx.createObjectiveMarker(spot, 0xfacc15);
+    this.keysPos = spot.clone();
+    this.worldData.interactables.push({
+      id: 'truck_keys',
+      type: 'keys',
+      label: 'Truck Keys',
+      subLabel: 'Take them',
+      position: spot.clone().setY(0.6),
+      radius: 2.4,
+      mesh: keys,
+      data: { marker },
+    });
+  }
+
+  private static clockText(timeOfDay: number): string {
+    const minutes = Math.floor(((6 + timeOfDay * 24) % 24) * 60);
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+  }
+
+  /** Bed in the sealed safehouse: time-lapse to dawn while the horde tests your barricades. */
+  private startRest(): void {
+    if (!this.player || !this.fort || !this.dayNight || !this.zombieManager) return;
+    const phase = this.dayNight.phase;
+    if (phase === 'day') {
+      this.showToast("It's still light out. Rest once the sun goes down.");
+      return;
+    }
+    if (this.fort.buildingAt(this.player.getPosition())?.id !== 'Safehouse') return;
+    if (!this.fort.isSealed('Safehouse')) {
+      const [n, m] = this.fort.sealedCount('Safehouse');
+      this.audio.playUI('ui_error', 0.5);
+      this.showToast(`Seal every door and window first (${n}/${m}).`);
+      return;
+    }
+    const intruder = this.zombieManager.zombies.some((z) => z.state !== 'dead' && this.fort!.buildingAt(z.group.position)?.id === 'Safehouse');
+    if (intruder) {
+      this.showToast("You can't rest with one of them in here!");
+      return;
+    }
+    this.resting = { lastPhase: phase };
+    this.audio.playUI('gear_rustle', 0.5, 0.8);
+    this.input.exitPointerLock();
+  }
+
+  private updateRest(dt: number): void {
+    if (!this.resting || !this.dayNight || !this.fort || !this.player || !this.zombieManager) return;
+    const sim = dt * 26; // a night passes in a few seconds
+    this.dayNight.update(sim, this.elapsed, this.player.getPosition(), this.camera.position);
+    const alive = this.zombieManager.aliveCount();
+    const intensity = this.dayNight.nightFactor() * (0.6 + alive / 30);
+    const breached = this.fort.siegeTick('Safehouse', intensity, sim);
+    this.fort.update();
+    this.audio.setMuffle(0.55);
+
+    if (breached) {
+      // Woken by something coming through
+      this.resting = null;
+      this.fort.destroy(breached);
+      for (let i = 0; i < 2; i++) {
+        const z = this.zombieManager.spawnZombie(breached.outside, i ? 'shambler' : 'sprinter');
+        z.state = 'chase';
+        z.lastKnownPlayer = this.player.getPosition();
+      }
+      this.audio.playUI('zombie_roar', 0.9);
+      this.player.addTrauma(0.6);
+      this.showToast(`You jolt awake — something broke through the ${breached.entry.kind}!`, 4);
+      return;
+    }
+
+    const phase = this.dayNight.phase;
+    if (this.resting.lastPhase === 'dawn' && phase === 'day') {
+      this.resting = null;
+      this.player.health = Math.min(this.player.maxHealth, this.player.health + 50);
+      this.player.stamina = this.player.maxStamina;
+      this.player.hunger = Math.max(0, this.player.hunger - 20);
+      this.player.thirst = Math.max(0, this.player.thirst - 25);
+      // The horde drifts off with the daylight
+      for (const z of this.zombieManager.zombies) {
+        if (z.state === 'dead' || z.group.position.distanceTo(this.player.getPosition()) > 22) continue;
+        const sp = this.worldData.zombieSpawnPoints[Math.floor(Math.random() * this.worldData.zombieSpawnPoints.length)];
+        z.body.position.set(sp.x, z.radius, sp.z);
+        z.body.previousPosition.copy(z.body.position);
+        z.body.interpolatedPosition.copy(z.body.position);
+        z.state = 'patrol';
+      }
+      this.audio.playUI('raven', 0.5);
+      this.showToast('You wake at dawn. The barricades held. (+50 Health)', 4.5);
+      return;
+    }
+    this.resting.lastPhase = phase;
+  }
+
+  private restOverlay(): { clock: string; status: string } | null {
+    if (!this.resting || !this.fort || !this.dayNight) return null;
+    const lines = this.fort.slots
+      .filter((s) => s.entry.building === 'Safehouse')
+      .map((s) => {
+        const pct = s.barricade ? Math.max(0, s.barricade.hp / s.barricade.maxHp) : 0;
+        const bar = '█'.repeat(Math.round(pct * 10)).padEnd(10, '░');
+        const name = s.entry.kind === 'door' ? 'Front door ' : `Window (${s.entry.id.split('_').pop()})`;
+        return `${name.padEnd(16)} ${bar} ${Math.round(pct * 100)}%`;
+      });
+    return { clock: Game.clockText(this.dayNight.timeOfDay), status: lines.join('\n') };
+  }
+
+  /** Board the truck and smash out through the North Gate. */
+  private startEnding(): void {
+    if (this.ending || !this.player) return;
+    this.ending = { t: 0, truckSpeed: 0, boarded: false };
+    this.story?.notify('boarded');
+    this.input.exitPointerLock();
+    const truck = this.worldData.truck.root;
+    // Walk-up spot: driver's side of the cab
+    const door = truck.position.clone().add(new THREE.Vector3(-2.1, 0, -0.5));
+    this.player.teleport(door);
+    this.player.setYaw(Math.PI / 2);
+    this.audio.playUI('door_open', 0.7);
+    // The truck no longer blocks anything — it's leaving
+    const truckIt = this.worldData.interactables.find((i) => i.type === 'extraction_truck');
+    if (truckIt) truckIt.consumed = true;
+    this.worldData.extractionMarker.setActive(false);
+  }
+
+  private updateEnding(dt: number): void {
+    if (!this.ending || !this.player || !this.zombieManager) return;
+    const e = this.ending;
+    e.t += dt;
+    const truck = this.worldData.truck.root;
+
+    if (!e.boarded && e.t > 0.15) this.player.playJump();
+    if (!e.boarded && e.t > 0.7) {
+      e.boarded = true;
+      this.player.hideBody();
+      this.audio.playUI('door_open', 0.6, 0.8);
+      this.audio.playUI('crate_creak', 0.4, 0.6);
+    }
+    if (e.t > 1.1) {
+      e.truckSpeed = Math.min(16, e.truckSpeed + dt * 7);
+      truck.position.z -= e.truckSpeed * dt;
+      for (const w of this.worldData.truck.wheels) w.rotation.x -= (e.truckSpeed * dt) / 0.45;
+      this.engineLoop?.setRate(0.9 + e.truckSpeed / 14);
+      // Anything in the way gets ploughed aside
+      const front = truck.position.clone().add(new THREE.Vector3(0, 0, -3));
+      this.zombieManager.explosionAt(front, 2.6, 600);
+    }
+
+    // Cinematic cameras
+    const tp = truck.position;
+    if (e.t < 1.1) {
+      this.camera.position.set(tp.x - 6, 2.2, tp.z + 4.5);
+      this.camera.lookAt(tp.x - 1.5, 1.4, tp.z - 0.5);
+    } else if (e.t < 3.6) {
+      this.camera.position.lerp(new THREE.Vector3(tp.x + 2.5, 3.2, tp.z + 9), Math.min(1, dt * 4));
+      this.camera.lookAt(tp.x, 1.6, tp.z - 6);
+    } else {
+      // Hold on the gate while the truck tears off into the dark
+      this.camera.position.lerp(new THREE.Vector3(7, 4, -60), Math.min(1, dt * 2));
+      this.camera.lookAt(tp.x, 1.5, tp.z);
+    }
+    if (e.t > 3.0) this.audio.setMuffle(Math.min(0.8, (e.t - 3) * 0.25));
+    if (e.t > 6.2) {
+      this.ending = null;
+      this.endGame(true);
+    }
+  }
+
+  private updateGate(dt: number): void {
+    if (!this.siegeDone || this.gateOpen >= 1) return;
+    if (this.gateOpen === 0) {
+      this.physicsWorld.removeBody(this.worldData.gate.body);
+      this.audio.playPositional('debris_fall', this.worldData.gate.mesh.position, 0.8, 0.05, 12);
+      this.audio.playPositional('impact_metal', this.worldData.gate.mesh.position, 0.9, 0.05, 12, 0.6);
+    }
+    this.gateOpen = Math.min(1, this.gateOpen + dt / 3.5);
+    const eased = 1 - Math.pow(1 - this.gateOpen, 2);
+    this.worldData.gate.mesh.position.x = eased * 9.5;
+  }
+
   private showToast(msg: string, seconds = 3.6): void {
     this.toastMessage = msg;
     this.toastTimer = seconds;
@@ -827,24 +1104,11 @@ export class Game {
     let color = '#f59e0b';
     const pPos = this.player.getPosition();
 
-    if (this.extractionActive || (this.jerrycansCollected >= 3 && this.beaconCollected)) {
-      target = this.worldData.extractionPosition.clone().add(new THREE.Vector3(0, 3, 0));
-      label = this.extractionActive ? 'Defend' : 'Extract';
-      color = '#22c55e';
-    } else {
-      let best = Infinity;
-      for (const it of this.worldData.interactables) {
-        if (it.consumed) continue;
-        const want = (it.type === 'jerrycan' && this.jerrycansCollected < 3) || (it.type === 'beacon' && !this.beaconCollected);
-        if (!want) continue;
-        const d = it.position.distanceTo(pPos);
-        if (d < best) {
-          best = d;
-          target = it.position.clone().add(new THREE.Vector3(0, 1.2, 0));
-          label = it.type === 'jerrycan' ? 'Fuel' : 'Beacon';
-          color = it.type === 'jerrycan' ? '#ef4444' : '#38bdf8';
-        }
-      }
+    const goal = this.story?.target();
+    if (goal) {
+      target = goal.pos;
+      label = goal.label;
+      color = goal.color;
     }
     if (!target) return null;
 
@@ -923,6 +1187,16 @@ export class Game {
       return;
     }
 
+    if (this.resting) {
+      this.updateRest(dt);
+      this.vfx.update(dt, this.elapsed, this.player.getPosition());
+      this.audio.update(dt, true, this.player.getPosition());
+      this.story?.update(dt);
+      this.pushHud(dt);
+      this.composer.render();
+      return;
+    }
+
     // Timers
     this.survivedSeconds += dt;
     this.spawnGraceTimer = Math.max(0, this.spawnGraceTimer - dt);
@@ -939,9 +1213,15 @@ export class Game {
     this.physicsWorld.step(1 / 60, dt, 3);
 
     const raycastTargets = [...this.worldData.raycastTargets, ...this.zombieManager.getRaycastMeshes()];
-    this.player.update(dt, raycastTargets, this.inventoryOpen);
+    if (this.ending) {
+      this.player.updateAnimationOnly(dt);
+      this.updateEnding(dt);
+    } else {
+      this.player.update(dt, raycastTargets, this.inventoryOpen);
+    }
 
-    const pPos = this.player.getPosition();
+    // During the ending the horde chases the truck instead of the (boarded) player
+    const pPos = this.ending ? this.worldData.truck.root.position.clone().setY(0) : this.player.getPosition();
     this.zombieManager.update(
       dt,
       pPos,
@@ -949,7 +1229,7 @@ export class Game {
       this.dayNight.isNight(),
       this.extractionActive,
       (dmg, from) => {
-        if (!this.player || this.gameOver || this.spawnGraceTimer > 0) return;
+        if (!this.player || this.gameOver || this.spawnGraceTimer > 0 || this.ending) return;
         this.player.takeDamage(dmg);
         this.damageFlashTimer = 0.25;
         this.damageEvents.push({ from: from.clone(), t: 1.2 });
@@ -971,6 +1251,10 @@ export class Game {
     this.vfx.setRain(this.weather.rain);
     this.vfx.update(dt, this.elapsed, pPos);
     this.updateWorldEvents(dt);
+    this.updateGate(dt);
+    this.fort?.update();
+    this.story?.update(dt);
+    if (this.story?.stage === 'arrive' && this.fort?.buildingAt(pPos)?.id === 'Safehouse') this.story.notify('enteredSafehouse');
 
     // Audio: music follows night / being hunted / the siege; heartbeat & muffling at low health
     const hpFrac = this.player.health / this.player.maxHealth;
@@ -994,12 +1278,22 @@ export class Game {
       this.extractionInRange = pPos.distanceTo(this.worldData.extractionPosition) < EXTRACTION_RADIUS;
       if (this.extractionInRange) this.extractionTimer -= dt;
       this.worldData.extractionBeaconLight.intensity = 3.5 + Math.sin(this.elapsed * 12) * 2.0;
-      if (this.extractionTimer <= 0) {
-        this.endGame(true);
-        return;
+      if (this.extractionTimer <= 0 && !this.siegeDone) {
+        this.siegeDone = true;
+        this.extractionTimer = 0;
+        this.engineLoop?.setRate(1.35);
+        this.audio.playUI('ui_alert', 0.9);
+        this.story?.notify('siegeDone');
       }
     }
 
+    this.pushHud(dt);
+
+    this.composer.render();
+  };
+
+  private pushHud(dt: number): void {
+    if (!this.player || !this.zombieManager || !this.dayNight) return;
     this.hud.update(
       {
         health: this.player.health,
@@ -1045,13 +1339,21 @@ export class Game {
         damageFlashTimer: this.damageFlashTimer,
         waypoint: this.computeWaypoint(),
         damageIndicators: this.computeDamageIndicators(),
+        chapterLabel: this.story ? `Ch ${this.story.chapter} · ${this.story.title}` : '',
+        objectiveText: this.story?.objective() ?? '',
+        radio: this.story?.radio() ?? null,
+        bossHealth: (() => {
+          const boss = this.zombieManager.getBoss();
+          return boss ? boss.hp / boss.maxHp : null;
+        })(),
+        rest: this.restOverlay(),
+        cinematic: !!this.ending,
       },
       this.input.isPointerLocked,
       dt
     );
 
-    this.composer.render();
-  };
+  }
 
   private endGame(victory: boolean): void {
     this.gameOver = true;

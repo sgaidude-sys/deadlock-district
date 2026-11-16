@@ -43,7 +43,8 @@ type ElKey =
   | 'vignette' | 'day' | 'phase' | 'clockFill' | 'noiseBar' | 'kills' | 'objCans' | 'objBeacon' | 'objExtract'
   | 'dogPing' | 'toast' | 'hitMarker' | 'headshot' | 'chTop' | 'chBot' | 'chLeft' | 'chRight' | 'crosshair'
   | 'prompt' | 'promptTitle' | 'promptSub' | 'wpnName' | 'wpnMag' | 'wpnReserve' | 'wpnReloadWrap' | 'wpnReloadBar'
-  | 'wpnSlots' | 'pauseHint' | 'waypoint' | 'wpLabel' | 'wpDist' | 'wpArrow' | 'dmgRing' | 'stance';
+  | 'wpnSlots' | 'pauseHint' | 'waypoint' | 'wpLabel' | 'wpDist' | 'wpArrow' | 'dmgRing' | 'stance'
+  | 'bossBar' | 'bossFill' | 'radioBox' | 'radioSpeaker' | 'radioText' | 'restOverlay' | 'restClock' | 'restStatus';
 
 export class HUD {
   private root: HTMLElement;
@@ -158,10 +159,11 @@ export class HUD {
             <span id="hud-kills" class="text-zinc-400">☠ <b class="text-white">0</b></span>
           </div>
 
-          <div id="hud-objectives" class="hud-glass px-4 py-1.5 rounded-lg flex items-center gap-4 text-[11px] font-mono text-zinc-300">
-            <span id="obj-cans">⛽ Fuel 0/3</span>
-            <span id="obj-beacon">📻 Beacon ✗</span>
-            <span id="obj-extract" class="text-amber-300 font-bold hidden"></span>
+          <div id="hud-objectives" class="hud-glass px-4 py-1.5 rounded-lg flex items-center gap-3 text-[12px] max-w-[560px]">
+            <span id="obj-cans" class="font-mono text-[10px] uppercase tracking-[0.2em] text-red-400 whitespace-nowrap">Ch 1 · Day One</span>
+            <span class="w-px h-4 bg-white/15"></span>
+            <span id="obj-beacon" class="text-zinc-100 font-medium">Get inside the marked safehouse</span>
+            <span id="obj-extract" class="text-red-400 font-bold font-mono text-[11px] hidden whitespace-nowrap"></span>
           </div>
 
           <div id="hud-dog-ping" class="hidden px-3 py-1 rounded-full bg-amber-500/20 border border-amber-400/50 text-amber-200 text-xs font-mono animate-pulse">
@@ -238,6 +240,32 @@ export class HUD {
             <div id="wpn-reload-bar" class="h-full bg-amber-400" style="width:0%"></div>
           </div>
           <div id="wpn-slots" class="flex justify-end gap-1 mt-2"></div>
+        </div>
+
+        <!-- Boss health -->
+        <div id="boss-bar" class="hidden fixed top-28 left-1/2 -translate-x-1/2 w-[420px] text-center">
+          <div class="text-[11px] font-mono uppercase tracking-[0.35em] text-red-400 mb-1 drop-shadow">The Butcher</div>
+          <div class="h-2.5 bg-black/60 rounded-sm overflow-hidden border border-red-900/60">
+            <div id="boss-fill" class="h-full bg-gradient-to-r from-red-800 to-red-500" style="width:100%"></div>
+          </div>
+        </div>
+
+        <!-- Radio transmission -->
+        <div id="radio-box" class="radio-box hidden fixed left-1/2 -translate-x-1/2 bottom-[13.5rem] w-[560px] max-w-[92vw] hud-glass rounded-xl px-4 py-3">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="radio-led"></span>
+            <span id="radio-speaker" class="text-[10px] font-mono uppercase tracking-[0.25em] text-sky-300"></span>
+          </div>
+          <div id="radio-text" class="text-sm text-zinc-100 leading-snug min-h-[2.5em]"></div>
+        </div>
+
+        <!-- Resting time-lapse -->
+        <div id="rest-overlay" class="hidden fixed inset-0 flex items-center justify-center bg-black/80 z-20">
+          <div class="text-center">
+            <div class="text-[11px] font-mono uppercase tracking-[0.35em] text-zinc-400 mb-2">Resting</div>
+            <div id="rest-clock" class="text-4xl font-black text-white mb-3 tabular-nums"></div>
+            <div id="rest-status" class="text-sm text-zinc-300 font-mono whitespace-pre-line"></div>
+          </div>
         </div>
 
         <div id="pause-hint" class="hidden fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-1.5 rounded-full bg-zinc-900/90 border border-zinc-700 text-xs font-mono text-zinc-300 pointer-events-auto cursor-pointer">
@@ -323,6 +351,8 @@ export class HUD {
       wpnReserve: 'wpn-reserve', wpnReloadWrap: 'wpn-reload-wrap', wpnReloadBar: 'wpn-reload-bar',
       wpnSlots: 'wpn-slots', pauseHint: 'pause-hint', waypoint: 'waypoint', wpLabel: 'wp-label',
       wpDist: 'wp-dist', wpArrow: 'wp-arrow', dmgRing: 'dmg-ring', stance: 'hud-stance',
+      bossBar: 'boss-bar', bossFill: 'boss-fill', radioBox: 'radio-box', radioSpeaker: 'radio-speaker',
+      radioText: 'radio-text', restOverlay: 'rest-overlay', restClock: 'rest-clock', restStatus: 'rest-status',
     };
     for (const [k, id] of Object.entries(ids)) this.el[k as ElKey] = $(id);
 
@@ -486,20 +516,44 @@ export class HUD {
     }`;
     e.kills.innerHTML = `☠ <b class="text-white">${state.kills}</b>`;
 
-    // Objectives
-    e.objCans.textContent = `⛽ Fuel ${state.jerrycansCollected}/3`;
-    e.objCans.classList.toggle('text-emerald-400', state.jerrycansCollected >= 3);
-    e.objBeacon.textContent = state.beaconCollected ? '📻 Beacon ✓' : '📻 Beacon ✗';
-    e.objBeacon.classList.toggle('text-emerald-400', state.beaconCollected);
-    if (state.extractionActive) {
+    // Story objective
+    e.objCans.textContent = state.chapterLabel;
+    if (e.objBeacon.textContent !== state.objectiveText) {
+      e.objBeacon.textContent = state.objectiveText;
+      e.objBeacon.classList.remove('objective-flash');
+      void e.objBeacon.offsetWidth;
+      e.objBeacon.classList.add('objective-flash');
+    }
+    if (state.extractionActive && !state.extractionInRange) {
       e.objExtract.classList.remove('hidden');
-      e.objExtract.textContent = state.extractionInRange
-        ? `🚚 HOLD OUT ${Math.ceil(state.extractionTimer)}s`
-        : `⚠ RETURN TO TRUCK — ${Math.ceil(state.extractionTimer)}s`;
-      e.objExtract.classList.toggle('text-red-400', !state.extractionInRange);
+      e.objExtract.textContent = '⚠ RETURN TO THE TRUCK';
     } else {
       e.objExtract.classList.add('hidden');
     }
+
+    // Boss
+    e.bossBar.classList.toggle('hidden', state.bossHealth === null);
+    if (state.bossHealth !== null) e.bossFill.style.width = `${Math.max(0, state.bossHealth) * 100}%`;
+
+    // Radio transmission (typewriter)
+    if (state.radio) {
+      e.radioBox.classList.remove('hidden');
+      e.radioSpeaker.textContent = state.radio.speaker;
+      const n = Math.ceil(state.radio.text.length * state.radio.progress);
+      e.radioText.textContent = state.radio.text.slice(0, n);
+    } else {
+      e.radioBox.classList.add('hidden');
+    }
+
+    // Rest overlay
+    e.restOverlay.classList.toggle('hidden', !state.rest);
+    if (state.rest) {
+      e.restClock.textContent = state.rest.clock;
+      e.restStatus.textContent = state.rest.status;
+    }
+
+    // Cinematic: hide gameplay HUD chrome behind letterbox bars
+    this.hudEl.classList.toggle('cinematic', state.cinematic);
 
     e.dogPing.classList.toggle('hidden', state.dogAlertTimer <= 0);
 

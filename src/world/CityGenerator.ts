@@ -45,6 +45,36 @@ export interface VehicleInstance {
 
 export type SurfaceType = 'concrete' | 'grass' | 'wood';
 
+/** A doorway or window opening that can be barricaded (and that zombies route through). */
+export interface EntryPoint {
+  id: string;
+  building: string;
+  kind: 'door' | 'window';
+  /** Centre of the opening on the wall line (y = 0). */
+  position: THREE.Vector3;
+  /** Points to the outside of the building. */
+  normal: THREE.Vector3;
+  horizontal: boolean;
+  width: number;
+}
+
+export interface BuildingInfo {
+  id: string;
+  center: THREE.Vector3;
+  halfW: number;
+  halfD: number;
+}
+
+export interface GateInfo {
+  mesh: THREE.Object3D;
+  body: CANNON.Body;
+}
+
+export interface TruckInfo {
+  root: THREE.Group;
+  wheels: THREE.Object3D[];
+}
+
 export interface BurningBarrel {
   light: THREE.PointLight;
   baseIntensity: number;
@@ -83,6 +113,12 @@ export interface CityWorldData {
   firePositions: THREE.Vector3[];
   jukeboxPosition: THREE.Vector3;
   surfaceAt: (x: number, z: number) => SurfaceType;
+  entries: EntryPoint[];
+  buildings: BuildingInfo[];
+  gate: GateInfo;
+  truck: TruckInfo;
+  /** Yard spot where the Butcher waits. */
+  bossSpawn: THREE.Vector3;
 }
 
 /** Interior footprints of the enterable buildings (for footstep surfaces). */
@@ -114,6 +150,10 @@ export class CityGenerator {
   private vehicles: VehicleInstance[] = [];
   private firePositions: THREE.Vector3[] = [];
   private jukeboxPosition = new THREE.Vector3();
+  private entries: EntryPoint[] = [];
+  private buildings: BuildingInfo[] = [];
+  private gate!: GateInfo;
+  private truck!: TruckInfo;
   private windowMaterials: THREE.MeshStandardMaterial[] = [];
 
   private woodMat = new THREE.MeshStandardMaterial({ color: 0x6b4a30, roughness: 0.8 });
@@ -163,13 +203,16 @@ export class CityGenerator {
     this.buildPerimeterWalls();
 
     const campfirePos = new THREE.Vector3(-26, 0, 24);
-    this.buildEnterableBuilding('Safehouse', -26, 26, 16, 14, 0xb8aca2, 'north', 'SAFEHOUSE', '#f59e0b');
+    this.buildEnterableBuilding('Safehouse', -26, 26, 16, 14, 0xb8aca2, 'north', 'SAFEHOUSE', '#f59e0b', [
+      ['west', 2],
+      ['south', 3.5],
+    ]);
     this.populateSafehouse(-26, 26);
 
-    this.buildEnterableBuilding('Pharmacy', -26, -26, 16, 14, 0xa9b4b8, 'south', '+ PHARMACY', '#22c55e');
+    this.buildEnterableBuilding('Pharmacy', -26, -26, 16, 14, 0xa9b4b8, 'south', '+ PHARMACY', '#22c55e', [['north', -3]]);
     this.populatePharmacy(-26, -26);
 
-    this.buildEnterableBuilding('Diner', 26, 26, 16, 14, 0xc4a49a, 'west', "JOE'S DINER", '#ef4444');
+    this.buildEnterableBuilding('Diner', 26, 26, 16, 14, 0xc4a49a, 'west', "JOE'S DINER", '#ef4444', [['south', 1]]);
     this.populateDiner(26, 26);
 
     this.buildYard(26, -26);
@@ -211,6 +254,11 @@ export class CityGenerator {
       vehicles: this.vehicles,
       firePositions: this.firePositions,
       jukeboxPosition: this.jukeboxPosition,
+      entries: this.entries,
+      buildings: this.buildings,
+      gate: this.gate,
+      truck: this.truck,
+      bossSpawn: new THREE.Vector3(30, 0, -20),
       surfaceAt: (x: number, z: number): SurfaceType => {
         if (BUILDINGS.some(([cx, cz]) => Math.abs(x - cx) < 7.8 && Math.abs(z - cz) < 6.8)) return 'wood';
         if (Math.abs(x - 26) < 17 && Math.abs(z + 26) < 17) return 'grass';
@@ -314,8 +362,38 @@ export class CityGenerator {
     const h = 5;
     const len = 144;
     const mat = new THREE.MeshStandardMaterial({ map: metalTexture(), roughness: 0.75, metalness: 0.3 });
+    // North wall has a 9 m gate opening for the evac truck
+    const gateHalf = 4.5;
+    const sideLen = (len - gateHalf * 2) / 2;
+    for (const sx of [-1, 1]) {
+      const x = sx * (gateHalf + sideLen / 2);
+      const mesh = this.texturedBox(sideLen, h, 2, mat, 3);
+      mesh.position.set(x, h / 2, -70);
+      this.scene.add(mesh);
+      this.addStaticBox(x, h / 2, -70, sideLen, h, 2, mesh, { occludes: true, blocksSight: true });
+    }
+    const gateMat = new THREE.MeshStandardMaterial({ color: 0x5b6168, roughness: 0.5, metalness: 0.6, map: metalTexture() });
+    const gate = new THREE.Group();
+    const panel = this.texturedBox(gateHalf * 2, h - 0.4, 0.4, gateMat, 2);
+    panel.position.y = (h - 0.4) / 2;
+    gate.add(panel);
+    for (let i = -3; i <= 3; i++) {
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(0.12, h - 0.4, 0.55), this.metalMat);
+      bar.position.set(i * 1.3, (h - 0.4) / 2, 0);
+      gate.add(bar);
+    }
+    const stripe = new THREE.Mesh(
+      new THREE.BoxGeometry(gateHalf * 2, 0.35, 0.6),
+      new THREE.MeshStandardMaterial({ color: 0xf5c518, emissive: 0x3a2a00, emissiveIntensity: 0.3 })
+    );
+    stripe.position.y = 1.4;
+    gate.add(stripe);
+    gate.position.set(0, 0, -70);
+    this.scene.add(gate);
+    const gateBody = this.addStaticBox(0, h / 2, -70, gateHalf * 2, h, 0.6, panel, { occludes: true, blocksSight: true });
+    this.gate = { mesh: gate, body: gateBody };
+
     for (const [x, z, sx, sz] of [
-      [0, -70, len, 2],
       [0, 70, len, 2],
       [-70, 0, 2, len],
       [70, 0, 2, len],
@@ -369,7 +447,8 @@ export class CityGenerator {
     tintHex: number,
     doorSide: 'north' | 'south' | 'east' | 'west',
     signText: string,
-    signColor: string
+    signColor: string,
+    windows: ['north' | 'south' | 'east' | 'west', number][] = []
   ): void {
     const h = BUILDING_H;
     const t = 0.4;
@@ -397,61 +476,84 @@ export class CityGenerator {
       this.scene.add(tx);
     }
 
-    const makeWall = (x: number, z: number, sx: number, sz: number, hasDoor: boolean, isHorizontal: boolean) => {
-      const addSeg = (px: number, pz: number, ssx: number, ssz: number) => {
-        const wall = this.texturedBox(ssx, h, ssz, mat, 2);
-        wall.position.set(px, h / 2, pz);
-        this.scene.add(wall);
-        this.addStaticBox(px, h / 2, pz, ssx, h, ssz, wall, { occludes: true, blocksSight: true });
-      };
-      if (!hasDoor) {
-        addSeg(x, z, sx, sz);
-        return;
-      }
+    this.buildings.push({ id, center: new THREE.Vector3(cx, 0, cz), halfW: w / 2, halfD: d / 2 });
 
-      const doorW = 3.0;
-      const header = this.texturedBox(isHorizontal ? doorW : sx, 0.9, isHorizontal ? sz : doorW, mat, 2);
-      header.position.set(x, h - 0.45, z);
-      this.scene.add(header);
-      this.cameraOccluders.push(header);
+    type Side = 'north' | 'south' | 'east' | 'west';
+    const DOOR_W = 3.0;
+    const WIN_W = 1.6;
+    const SILL = 0.95;
+    const LINTEL = 2.3;
 
-      const sign = this.makeSign(signText, signColor, 3.4);
-      const out = doorSide === 'north' || doorSide === 'west' ? -1 : 1;
-      if (isHorizontal) {
-        sign.position.set(x, h - 0.45, z + out * (sz / 2 + 0.03));
-        sign.rotation.y = out > 0 ? 0 : Math.PI;
-      } else {
-        sign.position.set(x + out * (sx / 2 + 0.03), h - 0.45, z);
-        sign.rotation.y = out > 0 ? Math.PI / 2 : -Math.PI / 2;
-      }
-      this.scene.add(sign);
-
-      if (isHorizontal) {
-        const segW = (sx - doorW) / 2;
-        addSeg(x - (doorW / 2 + segW / 2), z, segW, sz);
-        addSeg(x + (doorW / 2 + segW / 2), z, segW, sz);
-      } else {
-        const segD = (sz - doorW) / 2;
-        addSeg(x, z - (doorW / 2 + segD / 2), sx, segD);
-        addSeg(x, z + (doorW / 2 + segD / 2), sx, segD);
-      }
-
-      this.interactables.push({
-        id: `barricade_${id}`,
-        type: 'barricade',
-        label: `Barricade ${id} Door`,
-        subLabel: 'Costs 10 Scrap • Zombies can break it',
-        position: new THREE.Vector3(x, 0.8, z),
-        radius: 3.0,
-        consumed: false,
-        data: { horizontal: isHorizontal, width: doorW },
-      });
+    const solid = (px: number, py: number, pz: number, ssx: number, ssy: number, ssz: number) => {
+      const seg = this.texturedBox(ssx, ssy, ssz, mat, 2);
+      seg.position.set(px, py, pz);
+      this.scene.add(seg);
+      this.addStaticBox(px, py, pz, ssx, ssy, ssz, seg, { occludes: true, blocksSight: ssy > 2 });
     };
 
-    makeWall(cx, cz - d / 2, w, t, doorSide === 'north', true);
-    makeWall(cx, cz + d / 2, w, t, doorSide === 'south', true);
-    makeWall(cx - w / 2, cz, t, d, doorSide === 'west', false);
-    makeWall(cx + w / 2, cz, t, d, doorSide === 'east', false);
+    /** One wall with any number of door/window openings along it. */
+    const makeWall = (side: Side, openings: { kind: 'door' | 'window'; offset: number }[]) => {
+      const horizontal = side === 'north' || side === 'south';
+      const len = horizontal ? w : d;
+      const wx = side === 'west' ? cx - w / 2 : side === 'east' ? cx + w / 2 : cx;
+      const wz = side === 'north' ? cz - d / 2 : side === 'south' ? cz + d / 2 : cz;
+      const normal = new THREE.Vector3(side === 'west' ? -1 : side === 'east' ? 1 : 0, 0, side === 'north' ? -1 : side === 'south' ? 1 : 0);
+      // position along the wall -> world
+      const at = (u: number) => (horizontal ? [wx + u, wz] : [wx, wz + u]) as [number, number];
+      const box = (u0: number, u1: number, y0: number, y1: number) => {
+        if (u1 - u0 < 0.05 || y1 - y0 < 0.05) return;
+        const [px, pz] = at((u0 + u1) / 2);
+        solid(px, (y0 + y1) / 2, pz, horizontal ? u1 - u0 : t, y1 - y0, horizontal ? t : u1 - u0);
+      };
+
+      const sorted = [...openings].sort((a, b) => a.offset - b.offset);
+      let cursor = -len / 2;
+      for (const op of sorted) {
+        const ow = op.kind === 'door' ? DOOR_W : WIN_W;
+        const u0 = op.offset - ow / 2;
+        const u1 = op.offset + ow / 2;
+        box(cursor, u0, 0, h);
+        if (op.kind === 'door') {
+          box(u0, u1, h - 0.9, h);
+          const [sx, sz] = at(op.offset);
+          const sign = this.makeSign(signText, signColor, 3.4);
+          sign.position.set(sx + normal.x * (t / 2 + 0.03), h - 0.45, sz + normal.z * (t / 2 + 0.03));
+          sign.rotation.y = Math.atan2(normal.x, normal.z);
+          this.scene.add(sign);
+        } else {
+          box(u0, u1, 0, SILL);
+          box(u0, u1, LINTEL, h);
+          // dark interior glass frame so the opening reads as a window
+          const [fx, fz] = at(op.offset);
+          const frame = new THREE.Mesh(
+            new THREE.BoxGeometry(horizontal ? ow + 0.12 : t + 0.06, 0.08, horizontal ? t + 0.06 : ow + 0.12),
+            this.darkWoodMat
+          );
+          frame.position.set(fx, SILL + 0.04, fz);
+          this.scene.add(frame);
+        }
+        const [ex, ez] = at(op.offset);
+        this.entries.push({
+          id: `${id}_${op.kind}_${side}`,
+          building: id,
+          kind: op.kind,
+          position: new THREE.Vector3(ex, 0, ez),
+          normal,
+          horizontal,
+          width: ow,
+        });
+        cursor = u1;
+      }
+      box(cursor, len / 2, 0, h);
+    };
+
+    const sides: Side[] = ['north', 'south', 'west', 'east'];
+    for (const side of sides) {
+      const ops: { kind: 'door' | 'window'; offset: number }[] = [];
+      if (side === doorSide) ops.push({ kind: 'door', offset: 0 });
+      for (const [ws, off] of windows) if (ws === side) ops.push({ kind: 'window', offset: off });
+      makeWall(side, ops);
+    }
 
     const light = new THREE.PointLight(0xffd2a1, 3.0, 15, 1.6);
     light.position.set(cx, h - 0.5, cz);
@@ -639,6 +741,14 @@ export class CityGenerator {
 
   private populateSafehouse(cx: number, cz: number): void {
     this.addSolid(this.makeBed(), cx - 5.5, cz + 4.5, 0);
+    this.interactables.push({
+      id: 'safehouse_bed',
+      type: 'bed',
+      label: 'Bed',
+      subLabel: 'Rest until dawn (safehouse must be sealed)',
+      position: new THREE.Vector3(cx - 4.6, 0.6, cz + 3.2),
+      radius: 2.0,
+    });
     this.addSolid(this.makeBed(), cx - 3.6, cz + 4.5, 0);
     this.addSolid(this.makeTable(), cx + 4, cz - 2.5, 0);
     this.placeModel('prop_couch', cx + 1, cz + 5.6, Math.PI, true);
@@ -868,7 +978,13 @@ export class CityGenerator {
     const truck = this.assets.cloneModel('veh_truck_armored');
     truck.position.copy(pos);
     truck.scale.setScalar(1.15);
+    truck.rotation.y = Math.PI; // nose toward the North Gate
     this.scene.add(truck);
+    const wheels: THREE.Object3D[] = [];
+    truck.traverse((o) => {
+      if (/wheel/i.test(o.name)) wheels.push(o);
+    });
+    this.truck = { root: truck, wheels };
     const box = new THREE.Box3().setFromObject(truck);
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
@@ -1163,7 +1279,7 @@ export class CityGenerator {
     this.interactables.push({
       id,
       type: 'beacon',
-      label: 'Radio Beacon Parts',
+      label: 'Shortwave Radio',
       subLabel: 'Extraction objective',
       position: new THREE.Vector3(x, 1.0, z),
       radius: 2.4,

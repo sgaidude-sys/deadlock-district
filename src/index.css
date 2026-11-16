@@ -186,3 +186,48 @@
   from { opacity: 0; }
   to { opacity: 1; }
 }
+
+/* ── Story HUD ─────────────────────────────────────── */
+.objective-flash {
+  animation: objective-flash 1.4s ease-out;
+}
+@keyframes objective-flash {
+  0% { color: #fde68a; text-shadow: 0 0 12px rgba(251, 191, 36, 0.8); }
+  100% { color: inherit; text-shadow: none; }
+}
+.radio-box {
+  border-color: rgba(56, 189, 248, 0.25);
+  box-shadow: 0 0 24px -8px rgba(56, 189, 248, 0.45);
+}
+.radio-led {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #ef4444;
+  box-shadow: 0 0 8px #ef4444;
+  animation: radio-led 0.9s steps(2) infinite;
+}
+@keyframes radio-led {
+  50% { opacity: 0.25; }
+}
+
+/* Cinematic letterbox: bars slide in, gameplay HUD fades out */
+#screen-hud::before,
+#screen-hud::after {
+  content: '';
+  position: fixed;
+  left: 0;
+  right: 0;
+  height: 0;
+  background: #000;
+  z-index: 30;
+  transition: height 0.8s ease;
+}
+#screen-hud::before { top: 0; }
+#screen-hud::after { bottom: 0; }
+#screen-hud.cinematic::before,
+#screen-hud.cinematic::after { height: 11vh; }
+#screen-hud.cinematic > *:not(#radio-box) {
+  opacity: 0 !important;
+  transition: opacity 0.6s ease;
+}

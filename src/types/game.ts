@@ -55,7 +55,7 @@ export type DayPhase = 'day' | 'dusk' | 'night' | 'dawn';
 
 export interface InteractableObject {
   id: string;
-  type: 'loot' | 'jerrycan' | 'beacon' | 'barricade' | 'campfire' | 'dog' | 'extraction_truck';
+  type: 'loot' | 'jerrycan' | 'beacon' | 'entry' | 'campfire' | 'dog' | 'extraction_truck' | 'bed' | 'keys';
   label: string;
   subLabel?: string;
   position: THREE.Vector3;
@@ -125,4 +125,10 @@ export interface HUDState {
   damageIndicators: DamageIndicator[];
   extractionInRange: boolean;
   isSprinting: boolean;
+  chapterLabel: string;
+  objectiveText: string;
+  radio: { speaker: string; text: string; progress: number } | null;
+  bossHealth: number | null;
+  rest: { clock: string; status: string } | null;
+  cinematic: boolean;
 }

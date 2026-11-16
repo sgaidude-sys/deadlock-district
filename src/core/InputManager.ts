@@ -47,9 +47,14 @@ export class InputManager {
   public requestPointerLock(): void {
     try {
       if (document.pointerLockElement !== this.domElement) {
-        const res = this.domElement.requestPointerLock?.() as unknown as Promise<void> | undefined;
+        // Raw, unaccelerated mouse input where supported (Chrome/Edge); plain lock otherwise.
+        const req = this.domElement.requestPointerLock as unknown as (opts?: object) => Promise<void> | undefined;
+        const res = req.call(this.domElement, { unadjustedMovement: true });
         if (res && typeof res.catch === 'function') {
-          res.catch(() => {});
+          res.catch(() => {
+            const plain = req.call(this.domElement);
+            if (plain && typeof plain.catch === 'function') plain.catch(() => {});
+          });
         }
       }
     } catch {
@@ -107,6 +112,10 @@ export class InputManager {
 
   private handleMouseMove = (e: MouseEvent): void => {
     if (!this.isPointerLocked) return;
+    // Chrome on Windows occasionally reports a bogus huge jump under pointer lock (and on the
+    // first event after locking), which whips the camera around. Real hand motion never moves
+    // hundreds of pixels in one event, so drop those outliers.
+    if (Math.abs(e.movementX) > 250 || Math.abs(e.movementY) > 250) return;
     this.mouseDeltaX += e.movementX * this.sensitivity;
     this.mouseDeltaY += e.movementY * this.sensitivity;
   };

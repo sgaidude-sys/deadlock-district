@@ -39,8 +39,14 @@ const CROUCH_HEIGHT = 0.95;
 const BODY_RADIUS = 0.38;
 
 // Ground speeds (m/s) and the speeds the kit clips were authored at, so feet don't slide.
-const SPEED = { walk: 1.9, jog: 3.9, sprint: 5.8, crouch: 1.5 };
-const CLIP_SPEED = { walk: 1.3, run: 2.1 };
+const SPEED = { walk: 1.9, jog: 3.6, sprint: 5.2, crouch: 1.5 };
+/**
+ * Ground speed each kit clip was authored for, measured from planted-foot travel
+ * (walk 1.8 m/s; run calibrated from stride length ≈ 2.7 m/s).
+ */
+const CLIP_SPEED = { walk: 1.8, run: 2.7 };
+/** Metres travelled per footstep sound, so steps line up with the feet. */
+const STRIDE = { walk: 0.78, run: 1.15 };
 
 const PITCH_MIN = -1.1; // looking down from above
 const PITCH_MAX = 0.55; // looking up
@@ -109,7 +115,12 @@ export class PlayerController {
 
   private fireCooldown = 0;
   private dryFireCooldown = 0;
-  private stepTimer = 0;
+  private stepDistance = 0;
+  private lastPos = new THREE.Vector3();
+  private actualSpeed = 0;
+  private locoMode: 'idle' | 'walk' | 'run' = 'idle';
+  private lastFacing = 0;
+  private lean = new THREE.Vector2();
   private pendingMelee = -1;
   private recoilPitch = 0;
   /** While > 0 the body stays turned toward the aim (after shooting). */
@@ -156,6 +167,7 @@ export class PlayerController {
       fixedRotation: true,
     });
     physicsWorld.addBody(this.body);
+    this.lastPos.set(spawnPos.x, 0, spawnPos.z);
 
     const modelKey = `survivor_${survivorId}`;
     this.modelGroup = this.assets.cloneModel(modelKey);
@@ -220,6 +232,45 @@ export class PlayerController {
 
   public setCameraOccluders(list: THREE.Object3D[]): void {
     this.cameraOccluders = list;
+  }
+
+  private jumped = false;
+
+  /**
+   * Hide the character (boarded the truck). Only the mesh and light cone are hidden — hiding the
+   * whole group would also hide the flashlight SpotLight, changing the scene's light set and
+   * forcing every material to recompile (a visible freeze).
+   */
+  public hideBody(): void {
+    this.modelGroup.visible = false;
+    this.volumetricCone.visible = false;
+    this.flashlight.intensity = 0;
+  }
+
+  /** One hop (climbing into the truck cab in the ending). */
+  public playJump(): void {
+    if (this.jumped) return;
+    this.jumped = true;
+    this.playAnim('Jump', true, 0.6);
+  }
+
+  /** Cutscenes: keep the rig animating and in place without reading input. */
+  public updateAnimationOnly(dt: number): void {
+    this.mixer?.update(dt);
+    this.animLockTimer = Math.max(0, this.animLockTimer - dt);
+    if (this.animLockTimer <= 0) this.playLocomotion('Idle_Gun');
+    const p = this.body.interpolatedPosition;
+    this.group.position.set(p.x, 0.06, p.z);
+    this.group.rotation.y = this.facing + Math.PI;
+  }
+
+  /** Instantly move the player (squeezing past a barricade, cutscenes). */
+  public teleport(p: THREE.Vector3): void {
+    this.body.position.set(p.x, BODY_RADIUS, p.z);
+    this.body.previousPosition.copy(this.body.position);
+    this.body.interpolatedPosition.copy(this.body.position);
+    this.body.velocity.set(0, 0, 0);
+    this.lastPos.set(p.x, 0, p.z);
   }
 
   /** Point both the camera and the body the same way (spawn). */
@@ -440,33 +491,58 @@ export class PlayerController {
     this.body.velocity.x += (targetVx - this.body.velocity.x) * accel;
     this.body.velocity.z += (targetVz - this.body.velocity.z) * accel;
 
-    const holdingGun = !this.equippedWeapon.isMelee;
-    const groundSpeed = Math.hypot(this.body.velocity.x, this.body.velocity.z);
-    if (isMoving) {
-      // When strafing/back-pedalling in combat stance, play the walk slower so it reads less "moonwalky"
-      const backwards = combatStance && moveDir.dot(this.getForward()) < -0.3;
-      if (this.isSprinting || (!this.isCrouching && !this.isAiming && !combatStance)) {
-        this.playLocomotion(holdingGun ? 'Run_Gun' : 'Run', groundSpeed / CLIP_SPEED.run);
-      } else {
-        this.playLocomotion(holdingGun ? 'Walk_Gun' : 'Walk', (groundSpeed / CLIP_SPEED.walk) * (backwards ? 0.8 : 1));
-      }
-      this.noiseLevel = Math.max(this.noiseLevel, this.isSprinting ? 30 : this.isCrouching ? 4 : 14);
+    // Animate from how fast we *actually* move (not how fast we want to): pushing into a wall,
+    // a car or a zombie no longer leaves the run cycle playing in slow motion on the spot.
+    const smoothPos = this.body.interpolatedPosition;
+    const moved = Math.hypot(smoothPos.x - this.lastPos.x, smoothPos.z - this.lastPos.z);
+    this.lastPos.set(smoothPos.x, 0, smoothPos.z);
+    const instSpeed = dt > 0 ? Math.min(12, moved / dt) : 0;
+    this.actualSpeed += (instSpeed - this.actualSpeed) * Math.min(1, dt * 12);
+    const v = this.actualSpeed;
 
-      this.stepTimer -= dt;
-      if (this.stepTimer <= 0) {
-        this.stepTimer = this.isSprinting ? 0.27 : this.isCrouching || this.isAiming ? 0.5 : 0.36;
-        const p = this.body.interpolatedPosition;
-        this.audio.playFootstep(this.surfaceAt(p.x, p.z), this.isCrouching ? 0.1 : this.isSprinting ? 0.34 : 0.22);
-      }
+    const holdingGun = !this.equippedWeapon.isMelee;
+    const slowStance = this.isCrouching || this.isAiming || combatStance;
+    // Hysteresis so the clip doesn't flicker around the thresholds
+    if (v < (this.locoMode === 'idle' ? 0.45 : 0.3)) this.locoMode = 'idle';
+    else if (slowStance) this.locoMode = 'walk';
+    else if (this.locoMode === 'run' ? v > 2.0 : v > 2.5) this.locoMode = 'run';
+    else this.locoMode = 'walk';
+
+    if (this.locoMode === 'run') {
+      this.playLocomotion(holdingGun ? 'Run_Gun' : 'Run', THREE.MathUtils.clamp(v / CLIP_SPEED.run, 0.8, 2.0));
+    } else if (this.locoMode === 'walk') {
+      const backwards = combatStance && isMoving && moveDir.dot(this.getForward()) < -0.3;
+      this.playLocomotion(holdingGun ? 'Walk_Gun' : 'Walk', THREE.MathUtils.clamp((v / CLIP_SPEED.walk) * (backwards ? 0.85 : 1), 0.5, 1.7));
     } else {
-      this.stepTimer = 0.05;
       this.playLocomotion(this.isCrouching ? 'Duck' : holdingGun ? 'Idle_Gun' : 'Idle');
     }
 
+    if (this.locoMode !== 'idle') {
+      this.noiseLevel = Math.max(this.noiseLevel, this.isSprinting ? 30 : this.isCrouching ? 4 : 14);
+      this.stepDistance += moved;
+      const stride = this.locoMode === 'run' ? STRIDE.run : STRIDE.walk;
+      if (this.stepDistance >= stride) {
+        this.stepDistance -= stride;
+        this.audio.playFootstep(this.surfaceAt(smoothPos.x, smoothPos.z), this.isCrouching ? 0.1 : this.isSprinting ? 0.34 : 0.22);
+      }
+    } else {
+      this.stepDistance = STRIDE.walk * 0.6; // first step lands soon after starting to move
+    }
+
+    // Subtle procedural lean: into turns, and forward when running
+    let turnRate = (this.facing - this.lastFacing) / Math.max(dt, 1e-4);
+    turnRate = Math.atan2(Math.sin(turnRate * dt), Math.cos(turnRate * dt)) / Math.max(dt, 1e-4);
+    this.lastFacing = this.facing;
+    const speedK = Math.min(1, v / 4);
+    const rollTarget = THREE.MathUtils.clamp(-turnRate * 0.035, -0.16, 0.16) * speedK;
+    const pitchTarget = (this.locoMode === 'run' ? 0.07 : 0.02) * speedK * (this.isSprinting ? 1.4 : 1);
+    this.lean.x += (pitchTarget - this.lean.x) * Math.min(1, dt * 6);
+    this.lean.y += (rollTarget - this.lean.y) * Math.min(1, dt * 6);
+    this.modelGroup.rotation.set(this.lean.x, 0, this.lean.y);
+
     this.body.position.y = BODY_RADIUS;
     this.body.velocity.y = 0;
-    const smooth = this.body.interpolatedPosition;
-    this.group.position.set(smooth.x, 0.06, smooth.z);
+    this.group.position.set(smoothPos.x, 0.06, smoothPos.z);
     // Kit models face +Z, so add PI to face along -Z when facing = 0
     this.group.rotation.y = this.facing + Math.PI;
 
@@ -627,8 +703,16 @@ export class PlayerController {
       const hit = this.camRaycaster.intersectObjects(this.cameraOccluders, true)[0];
       if (hit) allowed = Math.max(0.5, hit.distance - 0.3);
     }
-    const k = allowed < this.camDistance ? 1 : Math.min(1, dt * 5);
-    this.camDistance += (Math.min(allowed, targetDist) - this.camDistance) * k;
+    // Only a wall/obstacle may snap the boom in (otherwise the camera would clip through it).
+    // Stance changes — stopping a sprint, aiming down sights — used to snap too, which was the
+    // 0.5–1.5 m camera "jerk" every time you released Shift or pressed RMB. Those now ease.
+    const goal = Math.min(allowed, targetDist);
+    if (allowed < targetDist && allowed < this.camDistance) {
+      this.camDistance = allowed;
+    } else {
+      const rate = goal < this.camDistance ? 10 : 5;
+      this.camDistance += (goal - this.camDistance) * Math.min(1, dt * rate);
+    }
 
     const desired = pivot.clone().addScaledVector(boomDir, this.camDistance);
     desired.y = Math.max(0.35, desired.y);

@@ -5,6 +5,7 @@ import { AudioManager } from '../core/AudioManager';
 import { VFXManager } from '../core/VFXManager';
 import { ZombieAIState, ZombieArchetype } from '../types/game';
 import { BarricadeInstance } from '../world/CityGenerator';
+import type { RouteStep } from '../systems/FortificationSystem';
 
 export interface ZombieInstance {
   id: string;
@@ -66,7 +67,7 @@ interface ArchetypeSpec {
   scale: number;
   /** Native standing height of the kit model (metres). */
   height: number;
-  /** Ground speed (m/s) each loop clip covers at timeScale 1 (measured from the kit's foot travel). */
+  /** Ground speed (m/s) each loop clip covers at timeScale 1 (measured from planted-foot travel). */
   clipSpeed: { walk: number; run: number };
   clips: Record<AnimRole, string>;
 }
@@ -90,7 +91,7 @@ const ARCHETYPES: Record<ZombieArchetype, ArchetypeSpec> = {
     radius: 0.38,
     scale: 1.1,
     height: 1.25,
-    clipSpeed: { walk: 0.8, run: 2.1 },
+    clipSpeed: { walk: 0.65, run: 2.8 },
     clips: { idle: 'Idle', walk: 'Walk', run: 'Run_Arms', attack: 'Punch', hit: 'HitReact', death: 'Death' },
   },
   sprinter: {
@@ -101,7 +102,7 @@ const ARCHETYPES: Record<ZombieArchetype, ArchetypeSpec> = {
     radius: 0.36,
     scale: 1.1,
     height: 1.4,
-    clipSpeed: { walk: 0.8, run: 2.0 },
+    clipSpeed: { walk: 0.65, run: 2.5 },
     clips: { idle: 'Idle', walk: 'Walk', run: 'Run', attack: 'Punch', hit: 'HitReact', death: 'Death' },
   },
   brute: {
@@ -112,7 +113,7 @@ const ARCHETYPES: Record<ZombieArchetype, ArchetypeSpec> = {
     radius: 0.55,
     scale: 1.25,
     height: 1.55,
-    clipSpeed: { walk: 0.8, run: 0.8 },
+    clipSpeed: { walk: 0.7, run: 0.7 },
     clips: { idle: 'Idle', walk: 'Walk', run: 'Walk', attack: 'Punch', hit: 'HitReact', death: 'Death' },
   },
   crawler: {
@@ -123,7 +124,7 @@ const ARCHETYPES: Record<ZombieArchetype, ArchetypeSpec> = {
     radius: 0.36,
     scale: 1.1,
     height: 0.6,
-    clipSpeed: { walk: 0.3, run: 0.3 },
+    clipSpeed: { walk: 0.6, run: 0.6 },
     clips: { idle: 'Crawl', walk: 'Crawl', run: 'Crawl', attack: 'Idle_Attack', hit: 'HitReact', death: 'Death' },
   },
 };
@@ -140,8 +141,10 @@ export class ZombieManager {
   private vfx: VFXManager;
   private spawnPoints: THREE.Vector3[];
   private sightBlockers: THREE.Object3D[];
-  private barricades: BarricadeInstance[] = [];
+  private router?: (from: THREE.Vector3, to: THREE.Vector3) => RouteStep | null;
   private onBarricadeBroken?: (b: BarricadeInstance) => void;
+  private bossId: string | null = null;
+  private onBossKilled?: (pos: THREE.Vector3) => void;
 
   private spawnTimer = 2.0;
   private idCounter = 0;
@@ -174,8 +177,12 @@ export class ZombieManager {
     }
   }
 
-  public setBarricades(list: BarricadeInstance[], onBroken: (b: BarricadeInstance) => void): void {
-    this.barricades = list;
+  /** Fortification routing: walk to openings, vault open windows, smash barricades in the way. */
+  public setRouter(
+    router: (from: THREE.Vector3, to: THREE.Vector3) => RouteStep | null,
+    onBroken: (b: BarricadeInstance) => void
+  ): void {
+    this.router = router;
     this.onBarricadeBroken = onBroken;
   }
 
@@ -202,12 +209,20 @@ export class ZombieManager {
     }
   }
 
-  public spawnZombie(pos: THREE.Vector3, archetype: ZombieArchetype): ZombieInstance {
+  public spawnZombie(
+    pos: THREE.Vector3,
+    archetype: ZombieArchetype,
+    opts: { scale?: number; hp?: number; damage?: number; speed?: number; tint?: number; boss?: boolean } = {}
+  ): ZombieInstance {
     this.idCounter++;
     const id = `zombie_${this.idCounter}`;
     const spec = ARCHETYPES[archetype];
     const modelKey = spec.models[Math.floor(Math.random() * spec.models.length)];
-    const { hp, speed, damage, radius, scale: scaleMod } = spec;
+    const hp = opts.hp ?? spec.hp;
+    const speed = opts.speed ?? spec.speed;
+    const damage = opts.damage ?? spec.damage;
+    const scaleMod = opts.scale ?? spec.scale;
+    const radius = spec.radius * (scaleMod / spec.scale);
 
     const group = this.assets.cloneModel(modelKey);
     group.position.set(pos.x + (Math.random() - 0.5) * 3, 0, pos.z + (Math.random() - 0.5) * 3);
@@ -224,6 +239,11 @@ export class ZombieManager {
         m.material = Array.isArray(m.material) ? m.material.map((mm) => mm.clone()) : m.material.clone();
         m.frustumCulled = false; // skinned bounds don't follow animation
         m.raycast = () => {}; // bullets use the hitbox below, never the skinned mesh
+        if (opts.tint !== undefined) {
+          for (const mat of Array.isArray(m.material) ? m.material : [m.material]) {
+            if (mat instanceof THREE.MeshStandardMaterial) mat.color.multiply(new THREE.Color(opts.tint));
+          }
+        }
         meshes.push(m);
       }
     });
@@ -300,6 +320,7 @@ export class ZombieManager {
       facing: Math.random() * Math.PI * 2,
     };
 
+    if (opts.boss) this.bossId = id;
     this.playZombieAnim(z, this.moveAnim(z, false));
     // Desync animation phases so crowds don't march in lockstep
     if (mixer) mixer.update(Math.random() * 3);
@@ -461,15 +482,27 @@ export class ZombieManager {
     return kills;
   }
 
+  public setOnBossKilled(cb: (pos: THREE.Vector3) => void): void {
+    this.onBossKilled = cb;
+  }
+
+  public getBoss(): ZombieInstance | null {
+    return this.zombies.find((z) => z.id === this.bossId && z.state !== 'dead') ?? null;
+  }
+
   public pinZombie(z: ZombieInstance, duration: number): void {
-    if (z.state === 'dead') return;
+    if (z.state === 'dead' || z.id === this.bossId) return;
     z.pinTimer = duration;
     z.staggerTimer = duration;
   }
 
   private killZombie(z: ZombieInstance, impulseDir: THREE.Vector3): void {
     z.state = 'dead';
-    z.deathTimer = 6;
+    z.deathTimer = z.id === this.bossId ? 12 : 6;
+    if (z.id === this.bossId) {
+      this.onBossKilled?.(z.group.position.clone());
+      this.bossId = null;
+    }
     z.deathFall = 0;
     this.kills++;
     this.physicsWorld.removeBody(z.body);
@@ -653,22 +686,40 @@ export class ZombieManager {
         continue;
       }
 
-      // Barricades in the way get torn down
-      const barricade = this.nearbyBarricade(zPos);
-      if (barricade && (z.state === 'chase' || z.state === 'investigate')) {
-        z.body.velocity.x *= 0.5;
-        z.body.velocity.z *= 0.5;
-        const toB = barricade.position.clone().sub(zPos);
-        this.turnToward(z, Math.atan2(toB.x, toB.z), dt, 8);
-        this.playZombieAnim(z, 'attack', 1.0);
-        if (z.attackCooldown <= 0) {
-          z.attackCooldown = 1.3;
-          barricade.hp -= z.damage;
-          this.audio.playPositional('wood_break', barricade.position, 0.45, 0.15);
-          if (barricade.hp <= 0) this.onBarricadeBroken?.(barricade);
+      // Walls in the way: head for an opening; climb through open windows; smash barricades
+      if (this.router && (z.state === 'chase' || z.state === 'investigate')) {
+        const step = this.router(zPos, targetPos);
+        if (step) {
+          if (step.attack && zPos.distanceTo(step.point) < 1.5) {
+            const b = step.attack;
+            z.body.velocity.x *= 0.5;
+            z.body.velocity.z *= 0.5;
+            const toB = b.position.clone().sub(zPos);
+            this.turnToward(z, Math.atan2(toB.x, toB.z), dt, 8);
+            this.playZombieAnim(z, 'attack', 1.0);
+            if (z.attackCooldown <= 0) {
+              z.attackCooldown = 1.3;
+              b.hp -= z.damage * (z.archetype === 'brute' ? 1.1 : 0.55); // planks ≈ 20 s vs one shambler
+              this.audio.playPositional(Math.random() < 0.5 ? 'wood_hit' : 'impact_wood', b.position, 0.6, 0.15, 6);
+              if (b.hp <= 0) this.onBarricadeBroken?.(b);
+            }
+            this.syncTransform(z, dt);
+            continue;
+          }
+          if (step.vaultTo && zPos.distanceTo(step.point) < 1.1) {
+            // Clamber through the window
+            z.body.position.set(step.vaultTo.x, z.radius, step.vaultTo.z);
+            z.body.previousPosition.copy(z.body.position);
+            z.body.interpolatedPosition.copy(z.body.position);
+            z.body.velocity.set(0, 0, 0);
+            z.staggerTimer = 0.45;
+            this.playZombieAnim(z, 'hit', 1.1, true);
+            this.audio.playPositional('gear_rustle', step.vaultTo, 0.6, 0.15, 5);
+            this.syncTransform(z, dt);
+            continue;
+          }
+          targetPos = step.point;
         }
-        this.syncTransform(z, dt);
-        continue;
       }
 
       const dir = targetPos.clone().sub(zPos).setY(0);
@@ -730,12 +781,6 @@ export class ZombieManager {
     }
   }
 
-  private nearbyBarricade(zPos: THREE.Vector3): BarricadeInstance | null {
-    for (const b of this.barricades) {
-      if (b.hp > 0 && b.position.distanceToSquared(zPos) < 2.2 * 2.2) return b;
-    }
-    return null;
-  }
 
   private turnToward(z: ZombieInstance, target: number, dt: number, rate: number): void {
     let diff = target - z.facing;
