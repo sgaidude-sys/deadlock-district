@@ -21,7 +21,29 @@ export interface StreetLightNode {
   baseIntensity: number;
   /** Some lamps die at night, the rest flicker. */
   failsAtNight: boolean;
+  /** Halo sprite around the bulb and the visible light cone under it (fog / rain). */
+  glow?: THREE.Sprite;
+  cone?: THREE.Mesh;
 }
+
+export interface ExplosiveBarrel {
+  id: string;
+  mesh: THREE.Group;
+  body: CANNON.Body;
+  position: THREE.Vector3;
+  exploded: boolean;
+}
+
+export interface VehicleInstance {
+  id: string;
+  mesh: THREE.Group;
+  position: THREE.Vector3;
+  /** Per-vehicle head/brake-light materials so alarms can flash them. */
+  lightMats: THREE.MeshStandardMaterial[];
+  alarmCooldown: number;
+}
+
+export type SurfaceType = 'concrete' | 'grass' | 'wood';
 
 export interface BurningBarrel {
   light: THREE.PointLight;
@@ -56,7 +78,19 @@ export interface CityWorldData {
   campfirePosition: THREE.Vector3;
   dogSpawnPosition: THREE.Vector3;
   zombieSpawnPoints: THREE.Vector3[];
+  explosiveBarrels: ExplosiveBarrel[];
+  vehicles: VehicleInstance[];
+  firePositions: THREE.Vector3[];
+  jukeboxPosition: THREE.Vector3;
+  surfaceAt: (x: number, z: number) => SurfaceType;
 }
+
+/** Interior footprints of the enterable buildings (for footstep surfaces). */
+const BUILDINGS: [number, number][] = [
+  [-26, 26],
+  [-26, -26],
+  [26, 26],
+];
 
 /** Top of sidewalk / interior floors. */
 export const FLOOR_Y = 0.06;
@@ -76,6 +110,10 @@ export class CityGenerator {
   private interactables: InteractableObject[] = [];
   private streetLights: StreetLightNode[] = [];
   private burningBarrels: BurningBarrel[] = [];
+  private explosiveBarrels: ExplosiveBarrel[] = [];
+  private vehicles: VehicleInstance[] = [];
+  private firePositions: THREE.Vector3[] = [];
+  private jukeboxPosition = new THREE.Vector3();
   private windowMaterials: THREE.MeshStandardMaterial[] = [];
 
   private woodMat = new THREE.MeshStandardMaterial({ color: 0x6b4a30, roughness: 0.8 });
@@ -139,6 +177,8 @@ export class CityGenerator {
     this.buildStreetFurniture();
     this.buildVehiclesAndCover();
     this.scatterDebris();
+    this.plantNature();
+    this.placeExplosiveBarrels();
 
     for (const [x, z] of [
       [-7, 7],
@@ -167,6 +207,15 @@ export class CityGenerator {
       extractionPosition: extractionPos,
       campfirePosition: campfirePos,
       dogSpawnPosition: new THREE.Vector3(-14, 0, 11),
+      explosiveBarrels: this.explosiveBarrels,
+      vehicles: this.vehicles,
+      firePositions: this.firePositions,
+      jukeboxPosition: this.jukeboxPosition,
+      surfaceAt: (x: number, z: number): SurfaceType => {
+        if (BUILDINGS.some(([cx, cz]) => Math.abs(x - cx) < 7.8 && Math.abs(z - cz) < 6.8)) return 'wood';
+        if (Math.abs(x - 26) < 17 && Math.abs(z + 26) < 17) return 'grass';
+        return 'concrete';
+      },
       zombieSpawnPoints: [
         new THREE.Vector3(-44, 0, -12),
         new THREE.Vector3(44, 0, -12),
@@ -580,6 +629,7 @@ export class CityGenerator {
     embers.position.set(pos.x, FLOOR_Y + 0.03, pos.z);
     this.scene.add(embers);
     this.vfx.registerFireEmitter(new THREE.Vector3(pos.x, FLOOR_Y + 0.15, pos.z), 0.9);
+    this.firePositions.push(new THREE.Vector3(pos.x, 0.4, pos.z));
 
     const fireLight = new THREE.PointLight(0xff7b29, 3.0, 12, 2);
     fireLight.position.set(pos.x, 1.0, pos.z);
@@ -632,6 +682,8 @@ export class CityGenerator {
     this.spawnLootCrate('crate_diner_1', cx + 2, cz + 5, 'burger');
     this.spawnLootCrate('crate_diner_2', cx - 5.5, cz + 5.2, 'water_bottle');
     this.spawnRadioBeacon('radio_beacon', cx + 4.5, cz + 0.2);
+    this.addSolid(this.makeJukebox(), cx - 6.9, cz - 5.6, Math.PI / 2);
+    this.jukeboxPosition.set(cx - 6.9, 1.0, cz - 5.6);
   }
 
   /** NE block: an overgrown freight yard of shipping containers. */
@@ -708,11 +760,21 @@ export class CityGenerator {
       const light = new THREE.PointLight(0xffd59a, 2.6, 20, 1.6);
       light.position.set(x + arm.x, 6.1, z + arm.z);
       this.scene.add(light);
+      const glow = this.vfx.createGlow(light.position.clone().add(new THREE.Vector3(0, -0.15, 0)), 0xffd59a, 2.2);
+      const cone = this.vfx.createFlashlightConeMesh();
+      cone.rotation.x = Math.PI / 2; // point straight down
+      cone.scale.set(0.55, 0.55, 0.38);
+      cone.position.copy(light.position).add(new THREE.Vector3(0, -0.2, 0));
+      (cone.material as THREE.ShaderMaterial).uniforms.uColor.value.setHex(0xffd9a0);
+      cone.raycast = () => {};
+      this.scene.add(cone);
       this.streetLights.push({
         light,
         bulbMat: bulbMat ?? new THREE.MeshStandardMaterial(),
         baseIntensity: 2.6,
         failsAtNight: i % 3 === 1,
+        glow,
+        cone,
       });
     });
 
@@ -873,20 +935,134 @@ export class CityGenerator {
   private placeVehicle(key: string, x: number, z: number, rotY: number): void {
     const veh = this.placeModel(key, x, z, rotY, true);
     veh.position.y = 0.02;
+    const id = `vehicle_${this.vehicles.length}`;
+    const lightMats: THREE.MeshStandardMaterial[] = [];
     veh.traverse((o) => {
+      o.userData.vehicleId = id;
       const mesh = o as THREE.Mesh;
       if (!mesh.isMesh) return;
-      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      for (const m of mats) {
-        // Wrecks: dead headlights / brake lights
-        if (m instanceof THREE.MeshStandardMaterial && /light/i.test(m.name)) m.emissiveIntensity = 0.2;
-      }
+      const swap = (m: THREE.Material) => {
+        // Wrecks: dead headlights / brake lights, each car with its own copy so alarms flash only it
+        if (m instanceof THREE.MeshStandardMaterial && /light/i.test(m.name)) {
+          const own = m.clone();
+          own.emissiveIntensity = 0.15;
+          lightMats.push(own);
+          return own;
+        }
+        return m;
+      };
+      mesh.material = Array.isArray(mesh.material) ? mesh.material.map(swap) : swap(mesh.material);
+    });
+    this.vehicles.push({ id, mesh: veh, position: new THREE.Vector3(x, 0, z), lightMats, alarmCooldown: 0 });
+  }
+
+  private makeJukebox(): THREE.Group {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(0.9, 1.5, 0.6),
+      new THREE.MeshStandardMaterial({ color: 0x6b1d1d, roughness: 0.4, metalness: 0.3 })
+    );
+    body.position.y = 0.75;
+    g.add(body);
+    const arch = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.45, 0.45, 0.6, 16, 1, false, 0, Math.PI),
+      new THREE.MeshStandardMaterial({ color: 0x2a0f05, emissive: 0xff9a3c, emissiveIntensity: 1.4 })
+    );
+    arch.rotation.set(Math.PI / 2, 0, Math.PI / 2);
+    arch.position.set(0, 1.5, 0);
+    g.add(arch);
+    const grille = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.6, 0.5),
+      new THREE.MeshStandardMaterial({ color: 0x1a1a1a, emissive: 0x4ad7ff, emissiveIntensity: 0.6 })
+    );
+    grille.position.set(0, 0.55, 0.301);
+    g.add(grille);
+    return g;
+  }
+
+  /** Dead trees, bushes and weeds from the Stylized Nature Pack. */
+  private plantNature(): void {
+    const trees = ['nat_deadtree_1', 'nat_deadtree_2', 'nat_deadtree_3', 'nat_deadtree_6', 'nat_deadtree_8', 'nat_deadtree_10'];
+    const spots: [number, number][] = [
+      [-6.6, -30], [6.6, -14], [-6.6, 30], [6.6, 28], [-30, 6.6], [-46, -6.6], [14, -6.6], [30, 6.6],
+      [46, -6.6], [-6.6, -46], [6.6, 48], [-48, 6.6],
+      // freight yard
+      [14, -28], [28, -13], [38, -38], [16, -40],
+    ];
+    spots.forEach(([x, z], i) => {
+      const t = this.assets.cloneModel(trees[i % trees.length]);
+      const box = new THREE.Box3().setFromObject(t);
+      const h = box.max.y - box.min.y;
+      const target = 4.5 + ((i * 37) % 10) / 4; // 4.5-7 m
+      if (h > 0.01) t.scale.setScalar(target / h);
+      t.position.set(x, FLOOR_Y, z);
+      t.rotation.y = i * 1.7;
+      t.traverse((o) => (o.castShadow = true));
+      this.scene.add(t);
+      this.raycastTargets.push(t);
+      this.addStaticBox(x, 2, z, 0.45, 4, 0.45);
+    });
+
+    // Weeds pushing through the yard and along building bases (seeded so the layout is stable)
+    let seed = 7;
+    const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    for (let i = 0; i < 70; i++) {
+      const inYard = i < 45;
+      const x = inYard ? 26 + (rand() - 0.5) * 32 : [-34.6, -17.4, 17.4, 34.6][i % 4] + (rand() - 0.5) * 0.6;
+      const z = inYard ? -26 + (rand() - 0.5) * 32 : [26, -26, 26, -26][i % 4] + (rand() - 0.5) * 12;
+      const key = rand() < 0.25 ? 'nat_bush_small' : rand() < 0.5 ? 'nat_grass_small' : 'nat_grass_large';
+      const g = this.assets.cloneModel(key);
+      const box = new THREE.Box3().setFromObject(g);
+      const h = box.max.y - box.min.y;
+      const target = key === 'nat_bush_small' ? 0.7 + rand() * 0.4 : 0.35 + rand() * 0.35;
+      if (h > 0.01) g.scale.setScalar(target / h);
+      g.position.set(x, FLOOR_Y, z);
+      g.rotation.y = rand() * Math.PI * 2;
+      g.traverse((o) => {
+        o.castShadow = false;
+        o.receiveShadow = true;
+      });
+      this.scene.add(g);
+    }
+  }
+
+  /** Red fuel drums that explode when shot (and chain-react). */
+  private placeExplosiveBarrels(): void {
+    const red = new THREE.MeshStandardMaterial({ color: 0xa3241b, roughness: 0.55, metalness: 0.35 });
+    const band = new THREE.MeshStandardMaterial({ color: 0xf5c518, roughness: 0.5, emissive: 0x3a2a00, emissiveIntensity: 0.4 });
+    const spots: [number, number][] = [
+      [-12, -14], [10, 14], [-20, -37], [36, -14], [18, 35], [-36, 18], [-3, -47], [44, 30], [-15, 2.5], [8, -26],
+    ];
+    spots.forEach(([x, z], i) => {
+      const id = `xbarrel_${i}`;
+      const barrel = this.assets.cloneModel('prop_barrel');
+      barrel.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (mesh.isMesh) mesh.material = red;
+        o.userData.explosiveId = id;
+      });
+      const stripe = new THREE.Mesh(new THREE.CylinderGeometry(0.355, 0.355, 0.12, 16, 1, true), band);
+      stripe.position.y = 0.78;
+      stripe.userData.explosiveId = id;
+      barrel.add(stripe);
+      barrel.position.set(x, FLOOR_Y, z);
+      barrel.rotation.y = i;
+      this.scene.add(barrel);
+      this.raycastTargets.push(barrel);
+      const body = new CANNON.Body({
+        mass: 0,
+        shape: new CANNON.Cylinder(0.36, 0.36, 1.14, 10),
+        position: new CANNON.Vec3(x, 0.6, z),
+      });
+      this.physicsWorld.addBody(body);
+      this.explosiveBarrels.push({ id, mesh: barrel, body, position: new THREE.Vector3(x, 0.5, z), exploded: false });
     });
   }
 
   private placeBurningBarrel(x: number, z: number): void {
     this.placeModel('prop_barrel', x, z, Math.random() * 3, true);
     this.vfx.registerFireEmitter(new THREE.Vector3(x, FLOOR_Y + 1.12, z), 1.1);
+    this.firePositions.push(new THREE.Vector3(x, 1.1, z));
     const light = new THREE.PointLight(0xff6b1a, 2.8, 15, 1.8);
     light.position.set(x, 1.7, z);
     this.scene.add(light);

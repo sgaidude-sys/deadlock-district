@@ -111,7 +111,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     noiseRadius: 78,
     trauma: 0.5,
     modelKey: 'gun_sniper',
-    sfxKey: 'gun_rifle',
+    sfxKey: 'gun_sniper',
     ammoType: 'rifle',
   },
 };

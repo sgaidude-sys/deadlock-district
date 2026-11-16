@@ -5,12 +5,14 @@ import * as SkeletonUtils from 'three/examples/jsm/utils/SkeletonUtils.js';
 /**
  * Every 3D model comes from the Zombie Apocalypse Kit (Quaternius, CC0), used at its native scale
  * so characters, vehicles, props and 8 m street tiles all match. Surfaces the kit doesn't provide
- * (walls, ground) are generated procedurally in ProceduralTextures.ts. Audio is the only other pack.
+ * (walls, ground) are generated procedurally in ProceduralTextures.ts. Other packs are used only
+ * through scripts/prepare_assets.py, which ships small, normalised copies: sounds (OGG), particle
+ * sprites (256 px) and a handful of nature models with downscaled textures.
  */
 export interface AssetEntry {
   key: string;
   url: string;
-  type: 'gltf' | 'audio';
+  type: 'gltf' | 'audio' | 'texture';
   /** Re-centre X/Z on the origin and drop the lowest point to y = 0. */
   centerGround?: boolean;
 }
@@ -19,6 +21,110 @@ const KIT = '/assets/zombie-kit';
 const C = (name: string) => `${KIT}/Characters/glTF/${name}.gltf`;
 const E = (name: string) => `${KIT}/Environment/glTF/${name}.gltf`;
 const V = (name: string) => `${KIT}/Vehicles/glTF/${name}.gltf`;
+
+const SFX_KEYS = [
+  'ui_click',
+  'ui_back',
+  'ui_alert',
+  'ui_hover',
+  'ui_confirm',
+  'ui_open',
+  'ui_close',
+  'ui_error',
+  'ui_powerup',
+  'ui_game_over',
+  'ui_complete',
+  'step_concrete1',
+  'step_concrete2',
+  'step_concrete3',
+  'step_concrete4',
+  'step_grass1',
+  'step_grass2',
+  'step_grass3',
+  'step_wood1',
+  'step_wood2',
+  'step_wood3',
+  'step_wood4',
+  'step_heavy',
+  'gear_rustle',
+  'gun_pistol',
+  'gun_pistol2',
+  'gun_smg',
+  'gun_smg2',
+  'gun_rifle',
+  'gun_rifle2',
+  'gun_sniper',
+  'gun_shotgun',
+  'gun_shotgun2',
+  'gun_shotgun3',
+  'gun_empty',
+  'reload',
+  'reload_mag',
+  'ammo_pickup',
+  'casing1',
+  'casing2',
+  'casing3',
+  'melee_swing',
+  'melee_swing2',
+  'melee_hit',
+  'melee_hit_heavy',
+  'impact_flesh1',
+  'impact_flesh2',
+  'impact_metal',
+  'impact_metal2',
+  'impact_concrete',
+  'impact_concrete2',
+  'impact_wood',
+  'impact_glass',
+  'wood_break',
+  'wood_hit',
+  'debris_fall',
+  'explosion',
+  'explosion_low',
+  'explosion_distant',
+  'zombie_groan1',
+  'zombie_groan2',
+  'zombie_groan3',
+  'zombie_hurt1',
+  'zombie_hurt2',
+  'zombie_hurt3',
+  'zombie_death',
+  'zombie_shriek1',
+  'zombie_shriek2',
+  'zombie_aggro',
+  'zombie_breath',
+  'zombie_bite',
+  'zombie_roar',
+  'brute_roar',
+  'brute_grunt1',
+  'brute_grunt2',
+  'brute_hurt',
+  'player_hurt1',
+  'player_gasp',
+  'heartbeat',
+  'scream_distant',
+  'dog_bark',
+  'loot_pickup',
+  'crate_open',
+  'crate_creak',
+  'door_open',
+  'objective_pickup',
+  'drink_sfx',
+  'eat_sfx',
+  'heal_sfx',
+  'hammer',
+  'switch',
+  'thunder',
+  'raven',
+  'loop_wind',
+  'loop_rain',
+  'loop_fire',
+  'loop_crickets',
+  'loop_eerie',
+  'loop_car_alarm',
+  'loop_engine',
+  'loop_record',
+];
 
 export const ASSET_MANIFEST: AssetEntry[] = [
   // Survivors & companion (rigs carry every weapon on the hand bone; feet already at y = 0)
@@ -77,35 +183,50 @@ export const ASSET_MANIFEST: AssetEntry[] = [
   { key: 'veh_truck', url: V('Vehicle_Truck'), type: 'gltf' },
   { key: 'veh_truck_armored', url: V('Vehicle_Truck_Armored'), type: 'gltf' },
 
-  // Audio (800-game-sound-effects)
-  { key: 'ui_click', url: '/assets/sfx/btn_48kHz_16bit_0.31s_01_s01.wav', type: 'audio' },
-  { key: 'ui_back', url: '/assets/sfx/back_48kHz_16bit_0.06s_01_s13.wav', type: 'audio' },
-  { key: 'ui_alert', url: '/assets/sfx/alert_48kHz_16bit_0.31s_01_s29.wav', type: 'audio' },
-  { key: 'step_concrete1', url: '/assets/sfx/concrete_48kHz_16bit_0.11s_01_s12.wav', type: 'audio' },
-  { key: 'step_concrete2', url: '/assets/sfx/concrete_48kHz_16bit_0.11s_02_s12.wav', type: 'audio' },
-  { key: 'melee_swing', url: '/assets/sfx/blade_03_48kHz_16bit_0.33s_01_s56.wav', type: 'audio' },
-  { key: 'melee_hit', url: '/assets/sfx/hit29_mp3_48kHz_16bit_0.53s_01_s66.wav', type: 'audio' },
-  { key: 'gun_pistol', url: '/assets/sfx/gunshot_48kHz_16bit_0.16s_01_s30.wav', type: 'audio' },
-  { key: 'gun_shotgun', url: '/assets/sfx/shotgun_48kHz_16bit_0.37s_01_s30.wav', type: 'audio' },
-  { key: 'gun_smg', url: '/assets/sfx/sfx_weapon_singleshot3_48kHz_16bit_0.19s_01_s30.wav', type: 'audio' },
-  { key: 'gun_rifle', url: '/assets/sfx/gun_48kHz_16bit_0.74s_01_s29.wav', type: 'audio' },
-  { key: 'reload', url: '/assets/sfx/reload_48kHz_16bit_0.49s_01_s29.wav', type: 'audio' },
-  { key: 'loot_pickup', url: '/assets/sfx/ammo_48kHz_16bit_0.25s_01_s29.wav', type: 'audio' },
-  { key: 'explosion', url: '/assets/sfx/explosion_48kHz_16bit_0.59s_01_s29.wav', type: 'audio' },
-  { key: 'zombie_groan1', url: '/assets/sfx/zombie_48kHz_16bit_0.66s_01_s36.wav', type: 'audio' },
-  { key: 'zombie_groan2', url: '/assets/sfx/zombie_48kHz_16bit_0.49s_02_s36.wav', type: 'audio' },
-  { key: 'zombie_groan3', url: '/assets/sfx/zombie_48kHz_16bit_0.77s_03_s36.wav', type: 'audio' },
-  { key: 'zombie_roar', url: '/assets/sfx/roar_48kHz_16bit_0.64s_01_s56.wav', type: 'audio' },
-  { key: 'dog_bark', url: '/assets/sfx/barking_02_48kHz_16bit_0.33s_01_s57.wav', type: 'audio' },
-  { key: 'wood_break', url: '/assets/sfx/bfh1_breaking_03_48kHz_16bit_0.46s_01_s63.wav', type: 'audio' },
-  { key: 'door_open', url: '/assets/sfx/door_08_48kHz_16bit_0.74s_01_s07.wav', type: 'audio' },
-  { key: 'drink_sfx', url: '/assets/sfx/bottle_48kHz_16bit_0.43s_01_s35.wav', type: 'audio' },
-  { key: 'heal_sfx', url: '/assets/sfx/bottle_pills_shake_48kHz_16bit_0.27s_01_s32.wav', type: 'audio' },
+  // Stylized Nature Pack (via scripts/prepare_assets.py)
+  { key: 'nat_deadtree_1', url: '/assets/nature/DeadTree_1.gltf', type: 'gltf', centerGround: true },
+  { key: 'nat_deadtree_2', url: '/assets/nature/DeadTree_2.gltf', type: 'gltf', centerGround: true },
+  { key: 'nat_deadtree_3', url: '/assets/nature/DeadTree_3.gltf', type: 'gltf', centerGround: true },
+  { key: 'nat_deadtree_6', url: '/assets/nature/DeadTree_6.gltf', type: 'gltf', centerGround: true },
+  { key: 'nat_deadtree_8', url: '/assets/nature/DeadTree_8.gltf', type: 'gltf', centerGround: true },
+  { key: 'nat_deadtree_10', url: '/assets/nature/DeadTree_10.gltf', type: 'gltf', centerGround: true },
+  { key: 'nat_bush_small', url: '/assets/nature/Bush_Small.gltf', type: 'gltf', centerGround: true },
+  { key: 'nat_bush', url: '/assets/nature/Bush.gltf', type: 'gltf', centerGround: true },
+  { key: 'nat_grass_large', url: '/assets/nature/Grass_Large.gltf', type: 'gltf', centerGround: true },
+  { key: 'nat_grass_small', url: '/assets/nature/Grass_Small.gltf', type: 'gltf', centerGround: true },
+
+  // Brackeys particle sprites (via scripts/prepare_assets.py)
+  { key: 'vfx_muzzle_01', url: '/assets/vfx/muzzle_01.png', type: 'texture' },
+  { key: 'vfx_muzzle_02', url: '/assets/vfx/muzzle_02.png', type: 'texture' },
+  { key: 'vfx_muzzle_04', url: '/assets/vfx/muzzle_04.png', type: 'texture' },
+  { key: 'vfx_flame_02', url: '/assets/vfx/flame_02.png', type: 'texture' },
+  { key: 'vfx_flame_03', url: '/assets/vfx/flame_03.png', type: 'texture' },
+  { key: 'vfx_flame_05', url: '/assets/vfx/flame_05.png', type: 'texture' },
+  { key: 'vfx_fire_01', url: '/assets/vfx/fire_01.png', type: 'texture' },
+  { key: 'vfx_smoke_01', url: '/assets/vfx/smoke_01.png', type: 'texture' },
+  { key: 'vfx_smoke_04', url: '/assets/vfx/smoke_04.png', type: 'texture' },
+  { key: 'vfx_smoke_07', url: '/assets/vfx/smoke_07.png', type: 'texture' },
+  { key: 'vfx_spark_01', url: '/assets/vfx/spark_01.png', type: 'texture' },
+  { key: 'vfx_spark_04', url: '/assets/vfx/spark_04.png', type: 'texture' },
+  { key: 'vfx_scorch_01', url: '/assets/vfx/scorch_01.png', type: 'texture' },
+  { key: 'vfx_scorch_02', url: '/assets/vfx/scorch_02.png', type: 'texture' },
+  { key: 'vfx_dirt_01', url: '/assets/vfx/dirt_01.png', type: 'texture' },
+  { key: 'vfx_dirt_03', url: '/assets/vfx/dirt_03.png', type: 'texture' },
+  { key: 'vfx_light_01', url: '/assets/vfx/light_01.png', type: 'texture' },
+  { key: 'vfx_light_02', url: '/assets/vfx/light_02.png', type: 'texture' },
+  { key: 'vfx_circle_05', url: '/assets/vfx/circle_05.png', type: 'texture' },
+  { key: 'vfx_trace_01', url: '/assets/vfx/trace_01.png', type: 'texture' },
+  { key: 'vfx_star_06', url: '/assets/vfx/star_06.png', type: 'texture' },
+
+  // Sound effects: 800-game-sound-effects, normalised OGG (via scripts/prepare_assets.py)
+  ...SFX_KEYS.map((key): AssetEntry => ({ key, url: `/assets/sfx/${key}.ogg`, type: 'audio' })),
 ];
 
 export class AssetManager {
   private gltfLoader = new GLTFLoader();
   private audioLoader = new THREE.AudioLoader();
+  private textureLoader = new THREE.TextureLoader();
+  private textures = new Map<string, THREE.Texture>();
 
   private models = new Map<string, THREE.Group>();
   private skinned = new Set<string>();
@@ -120,6 +241,10 @@ export class AssetManager {
       try {
         if (entry.type === 'audio') {
           this.audioBuffers.set(entry.key, await this.audioLoader.loadAsync(entry.url));
+        } else if (entry.type === 'texture') {
+          const tex = await this.textureLoader.loadAsync(entry.url);
+          tex.colorSpace = THREE.SRGBColorSpace;
+          this.textures.set(entry.key, tex);
         } else {
           const gltf = await this.gltfLoader.loadAsync(entry.url);
           this.registerModel(entry, gltf.scene, gltf.animations);
@@ -201,9 +326,12 @@ export class AssetManager {
     return this.clips.get(key) ?? [];
   }
 
-  /** Kept for API compatibility; all surface textures are procedural now. */
-  public getTexture(_key: string): THREE.Texture | undefined {
-    return undefined;
+  public getTexture(key: string): THREE.Texture | undefined {
+    return this.textures.get(key);
+  }
+
+  public hasAudio(key: string): boolean {
+    return this.audioBuffers.has(key);
   }
 
   public getAudioBuffer(key: string): AudioBuffer | undefined {

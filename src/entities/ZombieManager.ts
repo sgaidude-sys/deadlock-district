@@ -27,6 +27,8 @@ export interface ZombieInstance {
   staggerTimer: number;
   pinTimer: number;
   groanTimer: number;
+  stepTimer: number;
+  hurtVoiceAt: number;
   investigateTarget: THREE.Vector3 | null;
   patrolTarget: THREE.Vector3;
   lastKnownPlayer: THREE.Vector3 | null;
@@ -144,6 +146,7 @@ export class ZombieManager {
   private spawnTimer = 2.0;
   private idCounter = 0;
   private sightRay = new THREE.Raycaster();
+  private lastFleshSound = 0;
 
   constructor(
     scene: THREE.Scene,
@@ -280,6 +283,8 @@ export class ZombieManager {
       staggerTimer: 0,
       pinTimer: 0,
       groanTimer: 2 + Math.random() * 6,
+      stepTimer: Math.random() * 0.5,
+      hurtVoiceAt: 0,
       investigateTarget: null,
       patrolTarget: this.randomPatrolNear(group.position),
       lastKnownPlayer: null,
@@ -375,6 +380,16 @@ export class ZombieManager {
     z.body.velocity.z += impulseDir.z * knock;
 
     this.vfx.spawnBloodBurst(hitPoint, hitNormal, headshot ? 16 : 8);
+    const now = performance.now();
+    if (now - this.lastFleshSound > 45) {
+      this.lastFleshSound = now;
+      this.audio.playPositional('impact_flesh', hitPoint, 0.5, 0.12, 6);
+    }
+    if (z.hp > 0 && now > z.hurtVoiceAt) {
+      z.hurtVoiceAt = now + 650;
+      z.groanTimer = Math.max(z.groanTimer, 1.5);
+      this.audio.playPositional(z.archetype === 'brute' ? 'brute_hurt' : 'zombie_hurt', z.group.position, 0.6, 0.12);
+    }
 
     if (z.hp > 0 && z.archetype !== 'brute') this.playZombieAnim(z, 'hit', 1.4, true);
     if (z.hp <= 0) {
@@ -424,6 +439,28 @@ export class ZombieManager {
     return results;
   }
 
+  /** Area damage with falloff and outward knockback. Returns how many zombies it killed. */
+  public explosionAt(center: THREE.Vector3, radius: number, damage: number): number {
+    let kills = 0;
+    for (const z of this.zombies) {
+      if (z.state === 'dead') continue;
+      const to = z.group.position.clone().sub(center).setY(0);
+      const d = to.length();
+      if (d > radius) continue;
+      const falloff = Math.pow(1 - d / radius, 0.6);
+      const dir = d > 0.01 ? to.normalize() : new THREE.Vector3(1, 0, 0);
+      const hitPoint = z.group.position.clone().setY(z.height * 0.6);
+      const res = this.applyDamage(z, damage * falloff, hitPoint, dir.clone().setY(0.4).normalize(), dir, false);
+      if (res.killed) kills++;
+      else {
+        z.body.velocity.x += dir.x * 12 * falloff;
+        z.body.velocity.z += dir.z * 12 * falloff;
+        z.staggerTimer = Math.max(z.staggerTimer, 0.9 * falloff);
+      }
+    }
+    return kills;
+  }
+
   public pinZombie(z: ZombieInstance, duration: number): void {
     if (z.state === 'dead') return;
     z.pinTimer = duration;
@@ -436,7 +473,10 @@ export class ZombieManager {
     z.deathFall = 0;
     this.kills++;
     this.physicsWorld.removeBody(z.body);
-    this.audio.playPositional(z.archetype === 'brute' ? 'zombie_roar' : 'zombie_groan2', z.group.position, 0.7, 0.15);
+    const deathVoice = z.archetype === 'brute' ? 'brute_roar' : z.archetype === 'sprinter' ? 'zombie_shriek' : 'zombie_death';
+    this.audio.playPositional(deathVoice, z.group.position, 0.7, 0.12, 8, 0.25, z.archetype === 'brute' ? 0.8 : 1);
+    const fallPos = z.group.position.clone();
+    setTimeout(() => this.audio.playPositional('step_heavy', fallPos, z.archetype === 'brute' ? 0.9 : 0.45, 0.1, 5), 450);
     // Face the shooter so the kit's Death clip falls away from the shot
     z.facing = Math.atan2(-impulseDir.x, -impulseDir.z);
     z.group.rotation.set(0, z.facing, 0);
@@ -539,9 +579,8 @@ export class ZombieManager {
       z.groanTimer -= dt;
       if (z.groanTimer <= 0 && distToPlayer < 30) {
         z.groanTimer = (z.state === 'chase' ? 2.5 : 5) + Math.random() * 5;
-        const r = Math.random();
-        const sfx = z.archetype === 'brute' ? 'zombie_roar' : r < 0.33 ? 'zombie_groan1' : r < 0.66 ? 'zombie_groan2' : 'zombie_groan3';
-        this.audio.playPositional(sfx, zPos, z.state === 'chase' ? 0.6 : 0.4, 0.14);
+        const sfx = distToPlayer < 4 ? 'zombie_breath' : z.archetype === 'brute' ? 'brute_grunt' : 'zombie_groan';
+        this.audio.playPositional(sfx, zPos, z.state === 'chase' ? 0.6 : 0.4, 0.14, 8, 0.15, z.archetype === 'crawler' ? 1.2 : 1);
       }
 
       if (z.staggerTimer > 0 || z.pinTimer > 0) {
@@ -563,7 +602,8 @@ export class ZombieManager {
       const wasChasing = z.state === 'chase' || z.state === 'attack';
       if (extractionActive || z.canSeePlayer) {
         if (!wasChasing && distToPlayer < 18 && Math.random() < 0.5) {
-          this.audio.playPositional(z.archetype === 'brute' ? 'zombie_roar' : 'zombie_groan1', zPos, 0.55, 0.1);
+          const aggro = z.archetype === 'brute' ? 'brute_roar' : z.archetype === 'sprinter' ? 'zombie_aggro' : 'zombie_roar';
+          this.audio.playPositional(aggro, zPos, 0.65, 0.1, 8, 0.4, z.archetype === 'brute' ? 0.85 : 1);
         }
         if (z.state !== 'attack') z.state = 'chase';
         z.lastKnownPlayer = playerPos.clone();
@@ -669,6 +709,16 @@ export class ZombieManager {
         z.body.velocity.x += (dir.x * moveSpeed - z.body.velocity.x) * k;
         z.body.velocity.z += (dir.z * moveSpeed - z.body.velocity.z) * k;
         this.turnToward(z, Math.atan2(dir.x, dir.z), dt, 6);
+      }
+      if (z.archetype === 'brute' && distToPlayer < 24) {
+        const v = Math.hypot(z.body.velocity.x, z.body.velocity.z);
+        if (v > 0.4) {
+          z.stepTimer -= dt;
+          if (z.stepTimer <= 0) {
+            z.stepTimer = 0.62 / Math.min(2, v);
+            this.audio.playPositional('step_heavy', zPos, 0.55, 0.1, 6);
+          }
+        }
       }
       const chasing = z.state === 'chase';
       const anim = this.moveAnim(z, chasing);

@@ -25,6 +25,7 @@ interface ShellCasing {
   angVel: THREE.Vector3;
   age: number;
   lifetime: number;
+  landed: boolean;
 }
 
 interface FireEmitter {
@@ -40,6 +41,9 @@ export interface ObjectiveMarker {
 
 const ASH_COUNT = 700;
 const ASH_RANGE = 46;
+const RAIN_COUNT = 2600;
+const RAIN_RANGE = 40;
+const RAIN_HEIGHT = 18;
 
 export class VFXManager {
   private scene: THREE.Scene;
@@ -54,6 +58,21 @@ export class VFXManager {
 
   private muzzleLight: THREE.PointLight;
   private muzzleLightTimer = 0;
+  /** Persistent light reused for every explosion (adding/removing lights forces shader recompiles). */
+  private blastLight: THREE.PointLight;
+  private blastLightLevel = 0;
+  private scorches: THREE.Mesh[] = [];
+  private scorchGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
+  private onCasingLand?: (pos: THREE.Vector3) => void;
+  private casingSoundCooldown = 0;
+
+  // Rain: streaks that wrap around the camera, plus short-lived splash rings on the ground
+  private rain: THREE.LineSegments;
+  private rainMat: THREE.LineBasicMaterial;
+  private rainAmount = 0;
+  private splashes: THREE.InstancedMesh;
+  private splashLife: Float32Array;
+  private splashCursor = 0;
 
   private softTex: THREE.Texture;
   private ash: THREE.Points;
@@ -73,6 +92,37 @@ export class VFXManager {
 
     this.muzzleLight = new THREE.PointLight(0xffaa44, 0, 14, 2);
     this.scene.add(this.muzzleLight);
+    this.blastLight = new THREE.PointLight(0xff8a3a, 0, 28, 1.6);
+    this.scene.add(this.blastLight);
+
+    // Rain streaks (always in the scene so its shader is compiled up front; opacity 0 when dry)
+    const rainPos = new Float32Array(RAIN_COUNT * 6);
+    for (let i = 0; i < RAIN_COUNT; i++) {
+      const x = (Math.random() - 0.5) * RAIN_RANGE;
+      const y = Math.random() * RAIN_HEIGHT;
+      const z = (Math.random() - 0.5) * RAIN_RANGE;
+      rainPos.set([x, y, z, x + 0.05, y + 0.55, z + 0.02], i * 6);
+    }
+    const rainGeo = new THREE.BufferGeometry();
+    rainGeo.setAttribute('position', new THREE.BufferAttribute(rainPos, 3));
+    this.rainMat = new THREE.LineBasicMaterial({ color: 0xaec4d8, transparent: true, opacity: 0, depthWrite: false });
+    this.rain = new THREE.LineSegments(rainGeo, this.rainMat);
+    this.rain.frustumCulled = false;
+    this.scene.add(this.rain);
+
+    const splashMat = new THREE.MeshBasicMaterial({
+      color: 0xc8d8e8,
+      transparent: true,
+      opacity: 0.16,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    this.splashes = new THREE.InstancedMesh(new THREE.RingGeometry(0.03, 0.06, 10).rotateX(-Math.PI / 2), splashMat, 120);
+    this.splashes.frustumCulled = false;
+    this.splashLife = new Float32Array(120);
+    const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
+    for (let i = 0; i < 120; i++) this.splashes.setMatrixAt(i, hidden);
+    this.scene.add(this.splashes);
 
     this.softTex = VFXManager.makeSoftCircleTexture();
 
@@ -100,6 +150,16 @@ export class VFXManager {
     );
     this.ash.frustumCulled = false;
     this.scene.add(this.ash);
+  }
+
+  /** Random texture from the given keys (Brackeys sprites), falling back to the soft circle. */
+  private tex(...keys: string[]): THREE.Texture {
+    const found = keys.map((k) => this.assets.getTexture(k)).filter((t): t is THREE.Texture => !!t);
+    return found.length ? found[Math.floor(Math.random() * found.length)] : this.softTex;
+  }
+
+  public setOnCasingLand(cb: (pos: THREE.Vector3) => void): void {
+    this.onCasingLand = cb;
   }
 
   /** Radial-gradient sprite texture; avoids square artefacts from hard-edged PNGs. */
@@ -223,7 +283,7 @@ export class VFXManager {
     this.muzzleLight.intensity = big ? 9 : 6.5;
     this.muzzleLightTimer = 0.055;
 
-    const tex = this.assets.getTexture('vfx_flare') ?? this.softTex;
+    const tex = this.tex('vfx_muzzle_01', 'vfx_muzzle_02', 'vfx_muzzle_04');
     const mat = new THREE.SpriteMaterial({
       map: tex,
       color: 0xffc857,
@@ -264,7 +324,7 @@ export class VFXManager {
     lifetime = 0.7
   ): void {
     const mat = new THREE.SpriteMaterial({
-      map: this.assets.getTexture('vfx_smoke') ?? this.softTex,
+      map: this.tex('vfx_smoke_01', 'vfx_smoke_04', 'vfx_smoke_07'),
       color,
       transparent: true,
       opacity,
@@ -327,11 +387,12 @@ export class VFXManager {
       angVel: new THREE.Vector3(Math.random() * 18, Math.random() * 18, Math.random() * 18),
       age: 0,
       lifetime: 2.2,
+      landed: false,
     });
   }
 
   public spawnBloodBurst(pos: THREE.Vector3, normalDir: THREE.Vector3, count = 10): void {
-    const tex = this.assets.getTexture('vfx_dirt') ?? this.softTex;
+    const tex = this.tex('vfx_dirt_01', 'vfx_dirt_03');
     for (let i = 0; i < count; i++) {
       const mat = new THREE.SpriteMaterial({
         map: i % 2 === 0 ? tex : this.softTex,
@@ -369,7 +430,7 @@ export class VFXManager {
   }
 
   public spawnImpactSparks(pos: THREE.Vector3, normal: THREE.Vector3): void {
-    const tex = this.assets.getTexture('vfx_spark') ?? this.softTex;
+    const tex = this.tex('vfx_spark_01', 'vfx_spark_04');
     for (let i = 0; i < 6; i++) {
       const mat = new THREE.SpriteMaterial({
         map: tex,
@@ -427,8 +488,8 @@ export class VFXManager {
   private spawnEmber(pos: THREE.Vector3, intensity: number): void {
     const isSmoke = Math.random() < 0.35;
     const tex = isSmoke
-      ? this.assets.getTexture('vfx_smoke') ?? this.softTex
-      : this.assets.getTexture('vfx_fire') ?? this.assets.getTexture('vfx_flame') ?? this.softTex;
+      ? this.tex('vfx_smoke_01', 'vfx_smoke_04')
+      : this.tex('vfx_flame_02', 'vfx_flame_03', 'vfx_flame_05', 'vfx_fire_01');
 
     const mat = new THREE.SpriteMaterial({
       map: tex,
@@ -467,7 +528,203 @@ export class VFXManager {
     });
   }
 
+  /** Big fiery explosion: flash, fireball, sparks, debris, rising smoke and a scorch mark. */
+  public spawnExplosion(pos: THREE.Vector3, scale = 1): void {
+    this.blastLight.position.copy(pos).add(new THREE.Vector3(0, 1.2, 0));
+    this.blastLightLevel = 1;
+
+    const add = (
+      tex: THREE.Texture,
+      color: number,
+      p: THREE.Vector3,
+      vel: THREE.Vector3,
+      s0: number,
+      s1: number,
+      life: number,
+      opacity: number,
+      additive: boolean,
+      gravity = 0,
+      drag = 0
+    ) => {
+      const mat = new THREE.SpriteMaterial({
+        map: tex,
+        color,
+        transparent: true,
+        opacity,
+        depthWrite: false,
+        blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+        rotation: Math.random() * Math.PI * 2,
+      });
+      const sprite = new THREE.Sprite(mat);
+      sprite.position.copy(p);
+      sprite.scale.setScalar(s0);
+      this.scene.add(sprite);
+      this.particles.push({ sprite, velocity: vel, age: 0, lifetime: life, startScale: s0, endScale: s1, gravity, baseOpacity: opacity, drag });
+    };
+    const rnd = (k: number) => (Math.random() - 0.5) * k;
+
+    // Core flash
+    add(this.tex('vfx_star_06'), 0xffe2a8, pos.clone().setY(pos.y + 1), new THREE.Vector3(), 1.4 * scale, 4.5 * scale, 0.14, 0.9, true);
+    // Fireball
+    for (let i = 0; i < 14; i++) {
+      const dir = new THREE.Vector3(rnd(2), Math.random() * 1.4 + 0.2, rnd(2)).normalize();
+      add(
+        this.tex('vfx_flame_02', 'vfx_flame_03', 'vfx_flame_05', 'vfx_fire_01'),
+        [0xffb347, 0xff7a1a, 0xffd36b][i % 3],
+        pos.clone().add(new THREE.Vector3(rnd(0.6), 0.6 + Math.random() * 0.6, rnd(0.6))),
+        dir.multiplyScalar((3 + Math.random() * 4) * scale),
+        (0.8 + Math.random() * 0.8) * scale,
+        (2.2 + Math.random() * 1.5) * scale,
+        0.45 + Math.random() * 0.3,
+        0.95,
+        true,
+        -1.5,
+        3
+      );
+    }
+    // Sparks & debris
+    for (let i = 0; i < 26; i++) {
+      const dir = new THREE.Vector3(rnd(2), Math.random() * 1.2 + 0.4, rnd(2)).normalize();
+      add(
+        this.tex('vfx_spark_01', 'vfx_spark_04'),
+        i % 4 === 0 ? 0x3a3530 : 0xffc56b,
+        pos.clone().setY(pos.y + 0.8),
+        dir.multiplyScalar((7 + Math.random() * 9) * scale),
+        i % 4 === 0 ? 0.25 : 0.18,
+        0.05,
+        0.7 + Math.random() * 0.6,
+        1,
+        i % 4 !== 0,
+        14
+      );
+    }
+    // Rolling smoke column
+    for (let i = 0; i < 12; i++) {
+      add(
+        this.tex('vfx_smoke_01', 'vfx_smoke_04', 'vfx_smoke_07'),
+        i < 4 ? 0x2b2622 : 0x4a4540,
+        pos.clone().add(new THREE.Vector3(rnd(1.5), 0.8 + Math.random(), rnd(1.5))),
+        new THREE.Vector3(rnd(1.2), 1.5 + Math.random() * 2, rnd(1.2)).multiplyScalar(scale),
+        (1.4 + Math.random()) * scale,
+        (4.5 + Math.random() * 2.5) * scale,
+        2.5 + Math.random() * 2,
+        0.55,
+        false,
+        -0.25,
+        0.6
+      );
+    }
+    // Ground shockwave ring
+    add(this.tex('vfx_circle_05'), 0xffd9a0, pos.clone().setY(0.3), new THREE.Vector3(), 0.5, 9 * scale, 0.3, 0.6, true);
+    this.spawnScorch(pos, 3.2 * scale);
+  }
+
+  /** Persistent burn mark on the ground (capped). */
+  public spawnScorch(pos: THREE.Vector3, size: number): void {
+    const mat = new THREE.MeshBasicMaterial({
+      map: this.tex('vfx_scorch_01', 'vfx_scorch_02'),
+      color: 0x000000,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+    });
+    const m = new THREE.Mesh(this.scorchGeo, mat);
+    m.position.set(pos.x, pos.y < -5 ? pos.y : 0.075, pos.z); // (shader warm-up spawns far below the map)
+    m.rotation.y = Math.random() * Math.PI * 2;
+    m.scale.setScalar(size);
+    m.renderOrder = 1;
+    this.scene.add(m);
+    this.scorches.push(m);
+    if (this.scorches.length > 16) {
+      const old = this.scorches.shift()!;
+      this.scene.remove(old);
+      (old.material as THREE.Material).dispose();
+    }
+  }
+
+  /** Soft additive glow for a light source (street lamps, fire). Returns it so callers can dim it. */
+  public createGlow(pos: THREE.Vector3, color: number, size: number): THREE.Sprite {
+    const sprite = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: this.tex('vfx_light_01'),
+        color,
+        transparent: true,
+        opacity: 0.8,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      })
+    );
+    sprite.position.copy(pos);
+    sprite.scale.setScalar(size);
+    this.scene.add(sprite);
+    return sprite;
+  }
+
+  public setRain(amount: number): void {
+    this.rainAmount = THREE.MathUtils.clamp(amount, 0, 1);
+  }
+
+  private updateRain(dt: number, focus: THREE.Vector3): void {
+    this.rainMat.opacity = 0.24 * this.rainAmount;
+    if (this.rainAmount <= 0.01) return;
+    const pos = this.rain.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const a = pos.array as Float32Array;
+    const fall = 22 * dt;
+    const drift = 3 * dt;
+    const half = RAIN_RANGE / 2;
+    for (let i = 0; i < RAIN_COUNT; i++) {
+      const o = i * 6;
+      let x = a[o] + drift;
+      let y = a[o + 1] - fall;
+      let z = a[o + 2];
+      if (y < 0) y += RAIN_HEIGHT;
+      if (x - focus.x > half) x -= RAIN_RANGE;
+      else if (x - focus.x < -half) x += RAIN_RANGE;
+      if (z - focus.z > half) z -= RAIN_RANGE;
+      else if (z - focus.z < -half) z += RAIN_RANGE;
+      a[o] = x;
+      a[o + 1] = y;
+      a[o + 2] = z;
+      a[o + 3] = x + 0.08;
+      a[o + 4] = y + 0.55;
+      a[o + 5] = z + 0.02;
+    }
+    pos.needsUpdate = true;
+
+    // Splash rings near the player
+    const m = new THREE.Matrix4();
+    const spawn = Math.floor(90 * this.rainAmount * dt + Math.random());
+    for (let k = 0; k < spawn; k++) {
+      const i = this.splashCursor++ % this.splashLife.length;
+      this.splashLife[i] = 0.35;
+      m.makeTranslation(focus.x + (Math.random() - 0.5) * 16, 0.08, focus.z + (Math.random() - 0.5) * 16);
+      this.splashes.setMatrixAt(i, m);
+    }
+    const tmp = new THREE.Vector3();
+    const q = new THREE.Quaternion();
+    const sc = new THREE.Vector3();
+    for (let i = 0; i < this.splashLife.length; i++) {
+      if (this.splashLife[i] <= 0) continue;
+      this.splashLife[i] -= dt;
+      this.splashes.getMatrixAt(i, m);
+      m.decompose(tmp, q, sc);
+      const t = Math.max(0, this.splashLife[i]) / 0.35;
+      const s = t > 0 ? 0.6 + (1 - t) * 1.8 : 0;
+      m.compose(tmp, q, sc.set(s, s, s));
+      this.splashes.setMatrixAt(i, m);
+    }
+    this.splashes.instanceMatrix.needsUpdate = true;
+  }
+
   public update(dt: number, elapsed: number, focus?: THREE.Vector3): void {
+    this.casingSoundCooldown = Math.max(0, this.casingSoundCooldown - dt);
+    if (this.blastLightLevel > 0) {
+      this.blastLightLevel = Math.max(0, this.blastLightLevel - dt * 2.2);
+      this.blastLight.intensity = 40 * this.blastLightLevel * this.blastLightLevel;
+    }
+    if (focus) this.updateRain(dt, focus);
     if (this.muzzleLightTimer > 0) {
       this.muzzleLightTimer -= dt;
       if (this.muzzleLightTimer <= 0) {
@@ -562,8 +819,15 @@ export class VFXManager {
       c.mesh.position.addScaledVector(c.velocity, dt);
       c.mesh.rotation.x += c.angVel.x * dt;
       c.mesh.rotation.y += c.angVel.y * dt;
-      if (c.mesh.position.y < 0.03) {
-        c.mesh.position.y = 0.03;
+      if (c.mesh.position.y < 0.08) {
+        if (!c.landed) {
+          c.landed = true;
+          if (this.casingSoundCooldown <= 0) {
+            this.casingSoundCooldown = 0.07;
+            this.onCasingLand?.(c.mesh.position);
+          }
+        }
+        c.mesh.position.y = 0.08;
         c.velocity.y = Math.abs(c.velocity.y) * 0.4;
         c.velocity.x *= 0.65;
         c.velocity.z *= 0.65;

@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
 import { AssetManager } from '../core/AssetManager';
-import { AudioManager } from '../core/AudioManager';
+import { AudioManager, Surface } from '../core/AudioManager';
 import { InputManager } from '../core/InputManager';
 import { VFXManager } from '../core/VFXManager';
 import { WEAPONS } from '../data/catalog';
@@ -119,6 +119,8 @@ export class PlayerController {
   private onShotHit?: ShotHitCallback;
   private onMelee?: MeleeCallback;
   private cameraOccluders: THREE.Object3D[] = [];
+  private surfaceAt: (x: number, z: number) => Surface = () => 'concrete';
+  private gaspCooldown = 0;
 
   // Camera
   private shoulderSide = -1; // -1 = over the left shoulder (the gun hand), 1 = right
@@ -212,6 +214,10 @@ export class PlayerController {
     this.onMelee = cb;
   }
 
+  public setSurfaceResolver(fn: (x: number, z: number) => Surface): void {
+    this.surfaceAt = fn;
+  }
+
   public setCameraOccluders(list: THREE.Object3D[]): void {
     this.cameraOccluders = list;
   }
@@ -286,7 +292,7 @@ export class PlayerController {
     }
     this.fireCooldown = Math.max(this.fireCooldown, 0.25);
     this.currentAnim = ''; // re-pick the gun / melee locomotion set
-    if (!silent) this.audio.playUI('reload', 0.22, 1.6);
+    if (!silent) this.audio.playUI('gear_rustle', 0.4, 1.1);
   }
 
   public startReload(): void {
@@ -406,7 +412,14 @@ export class PlayerController {
     if (wantsSprint && this.isCrouching) this.isCrouching = false;
     this.isSprinting = wantsSprint && this.stamina > 2;
 
-    if (this.isSprinting) this.stamina = Math.max(0, this.stamina - dt * 20);
+    this.gaspCooldown = Math.max(0, this.gaspCooldown - dt);
+    if (this.isSprinting) {
+      this.stamina = Math.max(0, this.stamina - dt * 20);
+      if (this.stamina < 8 && this.gaspCooldown <= 0) {
+        this.gaspCooldown = 8;
+        this.audio.playUI('player_gasp', 0.45);
+      }
+    }
     else this.stamina = Math.min(this.maxStamina, this.stamina + dt * (isMoving ? 12 : 18));
 
     let speed = SPEED.jog;
@@ -442,11 +455,8 @@ export class PlayerController {
       this.stepTimer -= dt;
       if (this.stepTimer <= 0) {
         this.stepTimer = this.isSprinting ? 0.27 : this.isCrouching || this.isAiming ? 0.5 : 0.36;
-        this.audio.playUI(
-          Math.random() < 0.5 ? 'step_concrete1' : 'step_concrete2',
-          this.isCrouching ? 0.1 : this.isSprinting ? 0.32 : 0.22,
-          0.9 + Math.random() * 0.2
-        );
+        const p = this.body.interpolatedPosition;
+        this.audio.playFootstep(this.surfaceAt(p.x, p.z), this.isCrouching ? 0.1 : this.isSprinting ? 0.34 : 0.22);
       }
     } else {
       this.stepTimer = 0.05;
@@ -487,7 +497,7 @@ export class PlayerController {
     this.reserveAmmo[w.ammoType] -= load;
     this.isReloading = false;
     this.reloadTimer = 0;
-    this.audio.playUI('ui_back', 0.5, 0.8);
+    this.audio.playUI('reload_mag', 0.6);
   }
 
   private getMuzzlePosition(aimDir: THREE.Vector3): THREE.Vector3 {
@@ -532,14 +542,14 @@ export class PlayerController {
     this.noiseLevel = Math.max(this.noiseLevel, Math.min(100, w.noiseRadius * 1.4));
 
     const playerPos = this.getPosition();
-    this.audio.playPositional(w.sfxKey, playerPos, w.id === 'sniper' ? 1.0 : 0.85, 0.07, 10);
-    if (w.id === 'sniper') this.audio.playPositional('explosion', playerPos, 0.18, 0.05, 12);
+    // Gunshots feed the street reverb so they echo off the buildings
+    this.audio.playPositional(w.sfxKey, playerPos, w.id === 'sniper' ? 1.0 : 0.85, 0.06, 10, w.isMelee ? 0 : w.id === 'sniper' || w.id === 'shotgun' ? 0.8 : 0.5);
     this.audio.emitNoise(playerPos, w.noiseRadius);
 
     if (w.isMelee) {
       this.facing = this.yaw;
       this.playAnim('Slash', true, 0.5, 1.5);
-      this.audio.playUI('melee_swing', 0.5, 0.95 + Math.random() * 0.1);
+      this.audio.playUI('melee_swing', 0.55, 0.9 + Math.random() * 0.15);
       this.pendingMelee = 0.16;
       return;
     }

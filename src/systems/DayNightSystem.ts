@@ -16,6 +16,7 @@ uniform vec3 uHorizon;
 uniform vec3 uSunDir;
 uniform vec3 uSunColor;
 uniform float uNight;
+uniform float uCloud;
 varying vec3 vDir;
 float hash(vec3 p) { return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453); }
 void main() {
@@ -24,12 +25,14 @@ void main() {
   vec3 col = mix(uHorizon, uTop, pow(h, 0.55));
   // Sun / moon glow
   float sd = max(dot(d, normalize(uSunDir)), 0.0);
-  col += uSunColor * (pow(sd, 48.0) * 0.6 + pow(sd, 6.0) * 0.12) * (1.0 - uNight * 0.6);
+  col += uSunColor * (pow(sd, 48.0) * 0.6 + pow(sd, 6.0) * 0.12) * (1.0 - uNight * 0.6) * (1.0 - uCloud * 0.85);
   // Moon disc + stars at night
-  float moon = smoothstep(0.9985, 0.9992, sd) * uNight;
+  float moon = smoothstep(0.9985, 0.9992, sd) * uNight * (1.0 - uCloud);
   col = mix(col, vec3(0.86, 0.9, 1.0), moon);
   vec3 cell = floor(d * 260.0);
-  float star = step(0.9975, hash(cell)) * smoothstep(0.08, 0.35, d.y) * uNight;
+  float star = step(0.9975, hash(cell)) * smoothstep(0.08, 0.35, d.y) * uNight * (1.0 - uCloud);
+  // Overcast: flatten the gradient toward a low, even cloud layer
+  col = mix(col, uHorizon * 1.05, uCloud * 0.7);
   col += vec3(star) * 0.9;
   // Below horizon fades to fog colour
   col = mix(uHorizon, col, smoothstep(-0.05, 0.05, d.y));
@@ -41,6 +44,10 @@ export class DayNightSystem {
   public dayNumber = 1;
   public timeOfDay = 0.22; // Start in morning
   public phase: DayPhase = 'day';
+  /** Atmospheric haze multiplier (rain / fog makes lamp light cones more visible). */
+  public haze = 1;
+  /** 0 clear … 1 overcast (hides stars / moon / sun disc). */
+  public cloud = 0;
 
   private cycleDuration = 360; // ~4 min of light, ~2 min of night
   private sunLight: THREE.DirectionalLight;
@@ -99,6 +106,7 @@ export class DayNightSystem {
         uSunDir: { value: new THREE.Vector3(0, 1, 0) },
         uSunColor: { value: new THREE.Color() },
         uNight: { value: 0 },
+        uCloud: { value: 0 },
       },
       vertexShader: SKY_VERT,
       fragmentShader: SKY_FRAG,
@@ -187,6 +195,7 @@ export class DayNightSystem {
     this.skyMat.uniforms.uSunDir.value.copy(n > 0.5 ? this.moonDir : this.sunDir);
     this.skyMat.uniforms.uSunColor.value.copy(sunCol);
     this.skyMat.uniforms.uNight.value = n;
+    this.skyMat.uniforms.uCloud.value = this.cloud;
     this.sky.position.copy(cameraPos);
 
     // Streetlights: on from dusk; at night the grid browns out and some lamps die.
@@ -200,6 +209,11 @@ export class DayNightSystem {
       }
       sl.light.intensity = sl.baseIntensity * k;
       sl.bulbMat.emissiveIntensity = 0.15 + 2.2 * k;
+      if (sl.glow) (sl.glow.material as THREE.SpriteMaterial).opacity = 0.85 * k;
+      if (sl.cone) {
+        (sl.cone.material as THREE.ShaderMaterial).uniforms.uOpacity.value = 0.09 * k * this.haze;
+        sl.cone.visible = k > 0.01;
+      }
     }
 
     // Lit apartment windows & neon signs

@@ -7,14 +7,15 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 
 import { AssetManager } from './AssetManager';
-import { AudioManager } from './AudioManager';
+import { AudioManager, LoopHandle } from './AudioManager';
 import { InputManager } from './InputManager';
 import { VFXManager, ObjectiveMarker } from './VFXManager';
-import { BarricadeInstance, CityGenerator, CityWorldData } from '../world/CityGenerator';
+import { BarricadeInstance, CityGenerator, CityWorldData, ExplosiveBarrel, VehicleInstance } from '../world/CityGenerator';
 import { PlayerController } from '../entities/PlayerController';
 import { ZombieManager } from '../entities/ZombieManager';
 import { DogCompanion } from '../entities/DogCompanion';
 import { DayNightSystem } from '../systems/DayNightSystem';
+import { WeatherSystem } from '../systems/WeatherSystem';
 import { InventorySystem } from '../systems/InventorySystem';
 import { HUD } from '../ui/HUD';
 import { DamageIndicator, InteractableObject, SurvivorId, WaypointState, WeaponId } from '../types/game';
@@ -87,6 +88,11 @@ export class Game {
   private zombieManager: ZombieManager | null = null;
   private dog: DogCompanion | null = null;
   private dayNight: DayNightSystem | null = null;
+  private weather = new WeatherSystem();
+  private engineLoop: LoopHandle | null = null;
+  private alarms: { vehicle: VehicleInstance; loop: LoopHandle; t: number; noiseTimer: number }[] = [];
+  private pendingDetonations: { barrel: ExplosiveBarrel; t: number }[] = [];
+  private lastImpactSound = 0;
   private inventory: InventorySystem;
   private barricades: BarricadeInstance[] = [];
 
@@ -192,10 +198,16 @@ export class Game {
         if (msg) this.showToast(msg);
       },
       onCraftMedkit: () => {
-        if (this.player) this.showToast(this.inventory.craftMedkit(this.player));
+        if (!this.player) return;
+        const msg = this.inventory.craftMedkit(this.player);
+        if (msg.startsWith('Need')) this.audio.playUI('ui_error', 0.5);
+        this.showToast(msg);
       },
       onCraftAmmo: (type) => {
-        if (this.player) this.showToast(this.inventory.craftAmmo(this.player, type));
+        if (!this.player) return;
+        const msg = this.inventory.craftAmmo(this.player, type);
+        if (msg.startsWith('Need')) this.audio.playUI('ui_error', 0.5);
+        this.showToast(msg);
       },
       onToggleMute: () => {
         this.settings.muted = !this.settings.muted;
@@ -217,6 +229,21 @@ export class Game {
       },
     });
     this.hud.setSettings(this.settings.volume, this.settings.sensitivity, this.settings.muted);
+
+    // Interface sounds for every button in the HUD (delegated, so new buttons get them too)
+    let lastHover = 0;
+    uiRoot.addEventListener('mouseover', (e) => {
+      const btn = (e.target as HTMLElement).closest('button');
+      if (!btn || btn.contains(e.relatedTarget as Node)) return;
+      const now = performance.now();
+      if (now - lastHover > 60) {
+        lastHover = now;
+        this.audio.playUI('ui_hover', 0.25);
+      }
+    });
+    uiRoot.addEventListener('click', (e) => {
+      if ((e.target as HTMLElement).closest('button')) this.audio.playUI('ui_click', 0.35);
+    });
 
     window.addEventListener('resize', this.handleResize);
     new ResizeObserver(this.handleResize).observe(this.container);
@@ -277,10 +304,13 @@ export class Game {
       this.worldData.windowMaterials
     );
 
+    this.weather.collectMaterials(this.scene);
+    this.weather.onLightning((distance) => this.audio.playThunder(distance));
+
     this.dayNight.onNightFall(() => {
       if (!this.running) return;
       this.audio.playSiren();
-      this.audio.setTension(0.85);
+      if (Math.random() < 0.5) this.weather.forceRain();
       this.showToast('THE BLOOD SIREN WAILS — nightfall. Sprinters & Brutes are hunting.', 5);
     });
     this.dayNight.onDawn(() => {
@@ -312,6 +342,8 @@ export class Game {
     );
     this.player.setYaw(-0.7); // face the central intersection
     this.player.setCameraOccluders(this.worldData.cameraOccluders);
+    this.player.setSurfaceResolver(this.worldData.surfaceAt);
+    this.vfx.setOnCasingLand((pos) => this.audio.playPositional('casing', pos, 0.22, 0.12, 2.5));
 
     this.zombieManager = new ZombieManager(
       this.scene,
@@ -332,12 +364,29 @@ export class Game {
     });
 
     this.player.setOnShotHit((point, normal, obj, damage, impulseDir, weapon) => {
+      const explosiveId = Game.findTag(obj, 'explosiveId');
+      if (explosiveId) {
+        const barrel = this.worldData.explosiveBarrels.find((b) => b.id === explosiveId);
+        if (barrel) this.detonate(barrel);
+        return;
+      }
       const res = this.zombieManager?.damageZombieByObject(obj, damage, point, normal, impulseDir);
       if (res) {
         this.registerHit(res.killed ? 'kill' : res.headshot ? 'head' : 'hit');
         if (weapon.id === 'shotgun' || weapon.id === 'sniper' || res.killed) this.hitStopTimer = 0.03;
-      } else {
-        this.vfx.spawnImpactSparks(point, normal);
+        return;
+      }
+      this.vfx.spawnImpactSparks(point, normal);
+      const vehicleId = Game.findTag(obj, 'vehicleId');
+      const now = performance.now();
+      if (now - this.lastImpactSound > 50) {
+        this.lastImpactSound = now;
+        const isBarricade = this.barricades.some((b) => Game.isDescendant(obj, b.mesh));
+        this.audio.playPositional(vehicleId ? 'impact_metal' : isBarricade ? 'impact_wood' : 'impact_concrete', point, 0.45, 0.15, 4);
+      }
+      if (vehicleId) {
+        const v = this.worldData.vehicles.find((x) => x.id === vehicleId);
+        if (v) this.triggerCarAlarm(v);
       }
     });
 
@@ -353,6 +402,8 @@ export class Game {
 
     this.warmUpShaders();
     this.audio.startMusic();
+    for (const p of this.worldData.firePositions) this.audio.createLoop('loop_fire', p, 0.55, 2.5);
+    this.audio.createJukebox(this.worldData.jukeboxPosition);
     this.input.requestPointerLock();
     this.running = true;
     this.showToast('Find 3 Jerrycans + the Radio Beacon. Gunfire attracts the dead.', 5);
@@ -371,6 +422,7 @@ export class Game {
     this.vfx.spawnBloodBurst(hidden, up, 2);
     this.vfx.spawnImpactSparks(hidden, up);
     this.vfx.spawnBloodDecal(hidden);
+    this.vfx.spawnExplosion(hidden, 0.2);
     // Every zombie rig, including ones not in the starting population (brutes appear later)
     const standIns = ['zombie_basic', 'zombie_arm', 'zombie_ribcage', 'zombie_chubby'].map((k) => {
       const m = this.assets.cloneModel(k);
@@ -434,7 +486,7 @@ export class Game {
     this.input.onKeyPress('Tab', () => {
       if (!this.running || this.gameOver || this.paused) return;
       this.inventoryOpen = !this.inventoryOpen;
-      this.audio.playUI('ui_click', 0.3, this.inventoryOpen ? 1.1 : 0.9);
+      this.audio.playUI(this.inventoryOpen ? 'ui_open' : 'ui_close', 0.4);
       if (this.inventoryOpen) this.input.exitPointerLock();
       else this.input.requestPointerLock();
     });
@@ -504,8 +556,9 @@ export class Game {
       const gotText = this.inventory.pickup(itemId, this.player);
       const scrapGain = 10 + Math.floor(Math.random() * 8);
       this.player.scrap += scrapGain;
-      this.audio.playUI('loot_pickup', 0.65);
-      this.audio.playUI('door_open', 0.25, 1.3);
+      this.audio.playUI('crate_open', 0.6);
+      this.audio.playUI('crate_creak', 0.35, 1.2);
+      this.audio.playUI(itemId.startsWith('ammo') ? 'ammo_pickup' : 'loot_pickup', 0.6);
 
       const unlocks: Record<string, [WeaponId, string, 'pistol' | 'shells' | 'rifle', number]> = {
         crate_pharm_2: ['shotgun', 'Pump Shotgun', 'shells', 6],
@@ -519,7 +572,7 @@ export class Game {
         this.player.unlockWeapon(wid);
         this.player.reserveAmmo[ammo] += amount;
         this.player.equipWeapon(wid);
-        this.audio.playObjectiveChime();
+        this.audio.playUI('ui_powerup', 0.55);
         this.showToast(`Found ${wname} [${WEAPONS[wid].slot}]! ${gotText} • +${scrapGain} Scrap`, 4.5);
       } else {
         this.showToast(`${gotText} • +${scrapGain} Scrap`);
@@ -570,7 +623,8 @@ export class Game {
       this.extractionTimer = SIEGE_SECONDS;
       this.audio.playUI('ui_alert', 0.9);
       this.audio.playSiren();
-      this.audio.setTension(1.0);
+      this.engineLoop = this.audio.createLoop('loop_engine', this.worldData.extractionPosition.clone().setY(1), 0.7, 6);
+      this.engineLoop.setRate(0.7);
       this.worldData.extractionBeaconLight.color.setHex(0xef4444);
       this.showToast(`ENGINE PRIMING — hold the truck for ${SIEGE_SECONDS} seconds!`, 5);
     }
@@ -642,6 +696,106 @@ export class Game {
     this.showToast('A barricade has been smashed!');
   }
 
+  private static findTag(obj: THREE.Object3D, key: string): string | undefined {
+    let o: THREE.Object3D | null = obj;
+    while (o) {
+      if (o.userData[key]) return o.userData[key] as string;
+      o = o.parent;
+    }
+    return undefined;
+  }
+
+  private static isDescendant(obj: THREE.Object3D, root: THREE.Object3D): boolean {
+    let o: THREE.Object3D | null = obj;
+    while (o) {
+      if (o === root) return true;
+      o = o.parent;
+    }
+    return false;
+  }
+
+  /** Fuel drum explosion: area damage, knockback, chain reactions, car alarms, a lot of noise. */
+  private detonate(barrel: ExplosiveBarrel): void {
+    if (barrel.exploded) return;
+    barrel.exploded = true;
+    const pos = barrel.position.clone().setY(0.1);
+    this.scene.remove(barrel.mesh);
+    this.physicsWorld.removeBody(barrel.body);
+    const idx = this.worldData.raycastTargets.indexOf(barrel.mesh);
+    if (idx >= 0) this.worldData.raycastTargets.splice(idx, 1);
+
+    this.vfx.spawnExplosion(pos);
+    this.audio.playPositional('explosion', pos, 1.0, 0.05, 14, 1.0);
+    this.audio.playPositional('explosion_low', pos, 0.9, 0.05, 18, 0.6);
+    setTimeout(() => this.audio.playPositional('debris_fall', pos, 0.6, 0.15, 6), 350);
+    this.audio.emitNoise(pos, 70);
+
+    const kills = this.zombieManager?.explosionAt(pos, 7, 230) ?? 0;
+    if (kills > 0) {
+      this.registerHit('kill');
+      if (kills >= 3) this.showToast(`Fuel drum took out ${kills} infected!`, 2.5);
+    }
+
+    if (this.player) {
+      const d = this.player.getPosition().distanceTo(pos);
+      this.player.addTrauma(THREE.MathUtils.clamp(1.1 - d / 25, 0, 1));
+      if (d < 6.5 && !this.gameOver) {
+        this.player.takeDamage(Math.round(60 * (1 - d / 6.5)));
+        this.damageFlashTimer = 0.35;
+        this.damageEvents.push({ from: pos.clone(), t: 1.2 });
+      }
+      if (d < 12) this.hitStopTimer = 0.05;
+    }
+    for (const b of this.barricades.slice()) {
+      if (b.position.distanceTo(pos) < 5) this.breakBarricade(b);
+    }
+    for (const v of this.worldData.vehicles) {
+      if (v.position.distanceTo(pos) < 9) this.triggerCarAlarm(v);
+    }
+    for (const other of this.worldData.explosiveBarrels) {
+      if (!other.exploded && other.position.distanceTo(pos) < 5 && !this.pendingDetonations.some((p) => p.barrel === other)) {
+        this.pendingDetonations.push({ barrel: other, t: 0.18 + Math.random() * 0.15 });
+      }
+    }
+  }
+
+  /** Shooting a car sets off its alarm: flashing lights and a siren that pulls the horde in. */
+  private triggerCarAlarm(v: VehicleInstance): void {
+    if (v.alarmCooldown > 0 || this.alarms.some((a) => a.vehicle === v)) return;
+    const loop = this.audio.createLoop('loop_car_alarm', v.position.clone().setY(1), 0.65, 6);
+    this.alarms.push({ vehicle: v, loop, t: 9, noiseTimer: 0 });
+    if (this.alarms.length === 1) this.showToast('Car alarm! Every zombie nearby heard that.', 2.5);
+  }
+
+  private updateWorldEvents(dt: number): void {
+    for (const v of this.worldData.vehicles) v.alarmCooldown = Math.max(0, v.alarmCooldown - dt);
+    for (let i = this.alarms.length - 1; i >= 0; i--) {
+      const a = this.alarms[i];
+      a.t -= dt;
+      a.noiseTimer -= dt;
+      if (a.noiseTimer <= 0) {
+        a.noiseTimer = 1;
+        this.audio.emitNoise(a.vehicle.position, 45);
+      }
+      const on = Math.floor(a.t * 3) % 2 === 0;
+      for (const m of a.vehicle.lightMats) m.emissiveIntensity = on ? 3 : 0.15;
+      if (a.t <= 0) {
+        a.loop.stop(0.3);
+        for (const m of a.vehicle.lightMats) m.emissiveIntensity = 0.15;
+        a.vehicle.alarmCooldown = 20;
+        this.alarms.splice(i, 1);
+      }
+    }
+    for (let i = this.pendingDetonations.length - 1; i >= 0; i--) {
+      const p = this.pendingDetonations[i];
+      p.t -= dt;
+      if (p.t <= 0) {
+        this.pendingDetonations.splice(i, 1);
+        this.detonate(p.barrel);
+      }
+    }
+  }
+
   private showToast(msg: string, seconds = 3.6): void {
     this.toastMessage = msg;
     this.toastTimer = seconds;
@@ -654,6 +808,17 @@ export class Game {
     this.renderer.setSize(w, h);
     this.composer.setSize(w, h);
   };
+
+  /** Rain dims the sun and thickens the fog; lightning briefly floods the scene with light. */
+  private applyWeatherLighting(): void {
+    const r = this.weather.rain;
+    const f = this.weather.flash;
+    this.sunLight.intensity *= 1 - 0.55 * r;
+    this.hemiLight.intensity = this.hemiLight.intensity * (1 - 0.3 * r) + f * 2.4;
+    this.fog.density += r * 0.011;
+    this.fog.color.lerp(new THREE.Color(0x6b7380), r * 0.35);
+    if (f > 0) this.fog.color.lerp(new THREE.Color(0xc8d4ff), f * 0.5);
+  }
 
   private computeWaypoint(): WaypointState | null {
     if (!this.player) return null;
@@ -747,6 +912,7 @@ export class Game {
       this.camera.lookAt(this.titleLook);
       this.dayNight?.update(0, this.elapsed, this.titleLook, this.camera.position);
       this.vfx.update(dt, this.elapsed, this.camera.position);
+      this.audio.update(dt, false);
       this.composer.render();
       return;
     }
@@ -796,21 +962,29 @@ export class Game {
     }
 
     this.dog?.update(dt, pPos, this.player.facing, this.zombieManager);
+    const night = this.dayNight.nightFactor();
+    this.weather.update(dt, night);
+    this.dayNight.haze = 1 + this.weather.rain * 2.2;
+    this.dayNight.cloud = Math.min(1, this.weather.rain * 1.4);
     this.dayNight.update(dt, this.elapsed, pPos, this.camera.position);
+    this.applyWeatherLighting();
+    this.vfx.setRain(this.weather.rain);
     this.vfx.update(dt, this.elapsed, pPos);
+    this.updateWorldEvents(dt);
 
-    // Audio state: music tension, low-health heartbeat & muffling
+    // Audio: music follows night / being hunted / the siege; heartbeat & muffling at low health
     const hpFrac = this.player.health / this.player.maxHealth;
     const lowHealth = THREE.MathUtils.clamp((0.4 - hpFrac) / 0.4, 0, 1);
-    if (!this.extractionActive) {
-      let tension = this.dayNight.isNight() ? 0.85 : 0.1;
-      const chasing = this.zombieManager.zombies.some((z) => z.state === 'chase' && z.group.position.distanceTo(pPos) < 20);
-      if (chasing) tension = Math.max(tension, 0.55);
-      this.audio.setTension(tension);
+    let hunters = 0;
+    for (const z of this.zombieManager.zombies) {
+      if ((z.state === 'chase' || z.state === 'attack') && z.group.position.distanceTo(pPos) < 18) hunters++;
     }
+    this.audio.setMusicState(night, Math.min(1, hunters / 3), this.extractionActive);
+    this.audio.setWeather(this.weather.rain);
     this.audio.setHeartbeat(lowHealth);
     this.audio.setMuffle(lowHealth * 0.55);
-    this.audio.update(dt, this.dayNight.isNight());
+    this.audio.update(dt, this.dayNight.isNight(), pPos);
+    if (this.engineLoop) this.engineLoop.setRate(0.7 + 0.6 * (1 - this.extractionTimer / SIEGE_SECONDS));
 
     this.gradePass.uniforms.uLowHealth.value = lowHealth;
     this.gradePass.uniforms.uDamage.value = Math.min(1, this.damageFlashTimer / 0.25);
@@ -884,7 +1058,8 @@ export class Game {
     this.input.exitPointerLock();
     this.audio.setHeartbeat(0);
     this.audio.setMuffle(victory ? 0 : 0.7);
-    if (victory) this.audio.playObjectiveChime();
+    this.engineLoop?.stop(1.5);
+    if (victory) this.audio.playVictorySting();
     else this.audio.playDefeatSting();
     this.gradePass.uniforms.uLowHealth.value = victory ? 0 : 1;
     this.hud.showEndScreen({

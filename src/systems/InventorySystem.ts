@@ -67,7 +67,7 @@ export class InventorySystem {
     } else if (item.category === 'medkit') {
       this.audio.playUI('heal_sfx', 0.6);
     } else {
-      this.audio.playUI('loot_pickup', 0.45, 0.8);
+      this.audio.playUI('eat_sfx', 0.5);
     }
 
     this.consumeSlot(index);
