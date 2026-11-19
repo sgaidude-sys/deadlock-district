@@ -1,8 +1,10 @@
 import * as THREE from 'three';
 import { AssetManager } from './AssetManager';
+import type { Surface } from './AudioManager';
 
-interface Particle {
+interface PooledParticle {
   sprite: THREE.Sprite;
+  mat: THREE.SpriteMaterial;
   velocity: THREE.Vector3;
   age: number;
   lifetime: number;
@@ -11,12 +13,24 @@ interface Particle {
   gravity: number;
   baseOpacity: number;
   drag: number;
+  rotSpeed: number;
+  active: boolean;
 }
 
-interface Tracer {
+interface PooledTracer {
   mesh: THREE.Mesh;
+  mat: THREE.MeshBasicMaterial;
   age: number;
   lifetime: number;
+  active: boolean;
+}
+
+interface SlashArc {
+  mesh: THREE.Mesh;
+  mat: THREE.MeshBasicMaterial;
+  age: number;
+  lifetime: number;
+  active: boolean;
 }
 
 interface ShellCasing {
@@ -34,11 +48,24 @@ interface FireEmitter {
   intensity: number;
 }
 
+interface FogWisp {
+  sprite: THREE.Sprite;
+  mat: THREE.SpriteMaterial;
+  basePos: THREE.Vector3;
+  speed: number;
+  phase: number;
+  scale: number;
+}
+
 export interface ObjectiveMarker {
   group: THREE.Group;
   setActive(active: boolean): void;
 }
 
+const PARTICLE_POOL_SIZE = 320;
+const TRACER_POOL_SIZE = 32;
+const SLASH_POOL_SIZE = 4;
+const FOG_WISP_COUNT = 22;
 const ASH_COUNT = 700;
 const ASH_RANGE = 46;
 const RAIN_COUNT = 2600;
@@ -49,11 +76,18 @@ export class VFXManager {
   private scene: THREE.Scene;
   private assets: AssetManager;
 
-  private particles: Particle[] = [];
-  private tracers: Tracer[] = [];
+  private pool: PooledParticle[] = [];
+  private poolCursor = 0;
+  private tracerPool: PooledTracer[] = [];
+  private tracerCursor = 0;
+  private slashPool: SlashArc[] = [];
+  private slashCursor = 0;
+
   private casings: ShellCasing[] = [];
   private fireEmitters: FireEmitter[] = [];
+  private fogWisps: FogWisp[] = [];
   private decals: THREE.Object3D[] = [];
+  private bulletHoles: THREE.Mesh[] = [];
   private markers: { group: THREE.Group; beam: THREE.Mesh; glow: THREE.Sprite; phase: number }[] = [];
 
   private muzzleLight: THREE.PointLight;
@@ -63,6 +97,10 @@ export class VFXManager {
   private blastLightLevel = 0;
   private scorches: THREE.Mesh[] = [];
   private scorchGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
+  private holeGeo = new THREE.PlaneGeometry(0.14, 0.14);
+  private holeMatDark: THREE.MeshBasicMaterial;
+  private holeMatMetal: THREE.MeshBasicMaterial;
+
   private onCasingLand?: (pos: THREE.Vector3) => void;
   private casingSoundCooldown = 0;
 
@@ -70,6 +108,8 @@ export class VFXManager {
   private rain: THREE.LineSegments;
   private rainMat: THREE.LineBasicMaterial;
   private rainAmount = 0;
+  private nightAmount = 0;
+  private highQuality = true;
   private splashes: THREE.InstancedMesh;
   private splashLife: Float32Array;
   private splashCursor = 0;
@@ -79,21 +119,135 @@ export class VFXManager {
   private ashVel: Float32Array;
 
   private tracerGeo = new THREE.CylinderGeometry(1, 1, 1, 5, 1, true).rotateX(Math.PI / 2);
+  private slashGeo = new THREE.RingGeometry(0.55, 1.35, 18, 1, -Math.PI * 0.42, Math.PI * 0.84).rotateX(-Math.PI / 2);
   private casingGeo = new THREE.CylinderGeometry(0.012, 0.012, 0.045, 6);
   private casingMat = new THREE.MeshStandardMaterial({
-    color: 0xd9a74a,
-    metalness: 0.85,
-    roughness: 0.25,
+    color: 0xe3b354,
+    metalness: 0.9,
+    roughness: 0.22,
   });
+
+  // Scratch vectors to avoid per-frame allocations
+  private tmpMat4 = new THREE.Matrix4();
+  private tmpVec3 = new THREE.Vector3();
+  private tmpQuat = new THREE.Quaternion();
+  private tmpScale = new THREE.Vector3();
 
   constructor(scene: THREE.Scene, assets: AssetManager) {
     this.scene = scene;
     this.assets = assets;
 
-    this.muzzleLight = new THREE.PointLight(0xffaa44, 0, 14, 2);
+    this.softTex = VFXManager.makeSoftCircleTexture();
+
+    this.holeMatDark = new THREE.MeshBasicMaterial({
+      map: this.softTex,
+      color: 0x09090b,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -3,
+    });
+    this.holeMatMetal = new THREE.MeshBasicMaterial({
+      map: this.softTex,
+      color: 0x2a2d33,
+      transparent: true,
+      opacity: 0.82,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -3,
+    });
+
+    this.muzzleLight = new THREE.PointLight(0xffaa44, 0, 16, 1.9);
     this.scene.add(this.muzzleLight);
-    this.blastLight = new THREE.PointLight(0xff8a3a, 0, 28, 1.6);
+    this.blastLight = new THREE.PointLight(0xff8a3a, 0, 32, 1.5);
     this.scene.add(this.blastLight);
+
+    // Pre-allocate sprite particle pool (eliminates GC spikes during combat & explosions)
+    for (let i = 0; i < PARTICLE_POOL_SIZE; i++) {
+      const mat = new THREE.SpriteMaterial({
+        map: this.softTex,
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+      });
+      const sprite = new THREE.Sprite(mat);
+      sprite.visible = false;
+      sprite.frustumCulled = false;
+      this.scene.add(sprite);
+      this.pool.push({
+        sprite,
+        mat,
+        velocity: new THREE.Vector3(),
+        age: 0,
+        lifetime: 1,
+        startScale: 1,
+        endScale: 1,
+        gravity: 0,
+        baseOpacity: 1,
+        drag: 0,
+        rotSpeed: 0,
+        active: false,
+      });
+    }
+
+    // Pre-allocate bullet tracer pool
+    for (let i = 0; i < TRACER_POOL_SIZE; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffe9a8,
+        transparent: true,
+        opacity: 0.85,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(this.tracerGeo, mat);
+      mesh.visible = false;
+      mesh.frustumCulled = false;
+      this.scene.add(mesh);
+      this.tracerPool.push({ mesh, mat, age: 0, lifetime: 0.06, active: false });
+    }
+
+    // Pre-allocate melee slash arc pool
+    for (let i = 0; i < SLASH_POOL_SIZE; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xfef3c7,
+        transparent: true,
+        opacity: 0.7,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(this.slashGeo, mat);
+      mesh.visible = false;
+      this.scene.add(mesh);
+      this.slashPool.push({ mesh, mat, age: 0, lifetime: 0.16, active: false });
+    }
+
+    // Drifting low-lying ground fog wisps for nocturnal & stormy depth
+    for (let i = 0; i < FOG_WISP_COUNT; i++) {
+      const mat = new THREE.SpriteMaterial({
+        map: this.softTex,
+        color: 0x9aa9bc,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+      });
+      const sprite = new THREE.Sprite(mat);
+      const scale = 6 + (i % 5) * 2.2;
+      sprite.scale.set(scale * 1.4, scale * 0.55, 1);
+      const basePos = new THREE.Vector3((Math.random() - 0.5) * 90, 0.7 + Math.random() * 0.7, (Math.random() - 0.5) * 90);
+      sprite.position.copy(basePos);
+      this.scene.add(sprite);
+      this.fogWisps.push({
+        sprite,
+        mat,
+        basePos,
+        speed: 0.5 + Math.random() * 0.8,
+        phase: Math.random() * Math.PI * 2,
+        scale,
+      });
+    }
 
     // Rain streaks (always in the scene so its shader is compiled up front; opacity 0 when dry)
     const rainPos = new Float32Array(RAIN_COUNT * 6);
@@ -113,7 +267,7 @@ export class VFXManager {
     const splashMat = new THREE.MeshBasicMaterial({
       color: 0xc8d8e8,
       transparent: true,
-      opacity: 0.16,
+      opacity: 0.18,
       depthWrite: false,
       side: THREE.DoubleSide,
     });
@@ -123,8 +277,6 @@ export class VFXManager {
     const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
     for (let i = 0; i < 120; i++) this.splashes.setMatrixAt(i, hidden);
     this.scene.add(this.splashes);
-
-    this.softTex = VFXManager.makeSoftCircleTexture();
 
     // Falling ash: a box of particles that wraps around the camera
     const positions = new Float32Array(ASH_COUNT * 3);
@@ -140,16 +292,83 @@ export class VFXManager {
     this.ash = new THREE.Points(
       geo,
       new THREE.PointsMaterial({
-        size: 0.09,
+        size: 0.095,
         map: this.softTex,
-        color: 0xc9c2b8,
+        color: 0xd4cdc3,
         transparent: true,
-        opacity: 0.55,
+        opacity: 0.58,
         depthWrite: false,
       })
     );
     this.ash.frustumCulled = false;
     this.scene.add(this.ash);
+  }
+
+  public setQuality(high: boolean): void {
+    this.highQuality = high;
+    this.ash.visible = true;
+    for (let i = 0; i < this.fogWisps.length; i++) {
+      this.fogWisps[i].sprite.visible = high || i % 2 === 0;
+    }
+  }
+
+  public setAtmosphere(nightAmount: number, rainAmount: number): void {
+    this.nightAmount = THREE.MathUtils.clamp(nightAmount, 0, 1);
+    this.rainAmount = THREE.MathUtils.clamp(rainAmount, 0, 1);
+  }
+
+  /** Acquires a particle slot from the fixed pool without heap allocation. */
+  private emit(
+    tex: THREE.Texture,
+    color: number,
+    pos: THREE.Vector3,
+    vel: THREE.Vector3,
+    startScale: number,
+    endScale: number,
+    lifetime: number,
+    opacity: number,
+    additive: boolean,
+    gravity = 0,
+    drag = 0,
+    rotSpeed = 0
+  ): void {
+    // Search briefly for an inactive slot, otherwise overwrite oldest at cursor
+    let p = this.pool[this.poolCursor];
+    for (let tries = 0; tries < 16; tries++) {
+      const idx = (this.poolCursor + tries) % PARTICLE_POOL_SIZE;
+      if (!this.pool[idx].active) {
+        p = this.pool[idx];
+        this.poolCursor = (idx + 1) % PARTICLE_POOL_SIZE;
+        break;
+      }
+      if (tries === 15) {
+        this.poolCursor = (this.poolCursor + 1) % PARTICLE_POOL_SIZE;
+      }
+    }
+
+    p.active = true;
+    p.age = 0;
+    p.lifetime = lifetime;
+    p.startScale = startScale;
+    p.endScale = endScale;
+    p.gravity = gravity;
+    p.baseOpacity = opacity;
+    p.drag = drag;
+    p.rotSpeed = rotSpeed;
+    p.velocity.copy(vel);
+
+    p.mat.map = tex;
+    p.mat.color.setHex(color);
+    p.mat.opacity = opacity;
+    const blend = additive ? THREE.AdditiveBlending : THREE.NormalBlending;
+    if (p.mat.blending !== blend) {
+      p.mat.blending = blend;
+      p.mat.needsUpdate = true;
+    }
+    p.mat.rotation = Math.random() * Math.PI * 2;
+    p.sprite.position.copy(pos);
+    p.sprite.scale.setScalar(startScale);
+    p.sprite.visible = true;
   }
 
   /** Random texture from the given keys (Brackeys sprites), falling back to the soft circle. */
@@ -169,7 +388,7 @@ export class VFXManager {
     const g = c.getContext('2d')!;
     const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
     grad.addColorStop(0, 'rgba(255,255,255,1)');
-    grad.addColorStop(0.35, 'rgba(255,255,255,0.75)');
+    grad.addColorStop(0.35, 'rgba(255,255,255,0.72)');
     grad.addColorStop(1, 'rgba(255,255,255,0)');
     g.fillStyle = grad;
     g.fillRect(0, 0, 64, 64);
@@ -188,7 +407,6 @@ export class VFXManager {
 
   public createFlashlightConeMesh(): THREE.Mesh {
     const geo = new THREE.ConeGeometry(3.2, 16, 24, 1, true);
-    // Shift cone so tip is at origin and extends along +Z
     geo.translate(0, -8, 0);
     geo.rotateX(-Math.PI / 2);
 
@@ -199,7 +417,7 @@ export class VFXManager {
       blending: THREE.AdditiveBlending,
       uniforms: {
         uColor: { value: new THREE.Color(0xfff1c9) },
-        uOpacity: { value: 0.1 },
+        uOpacity: { value: 0.11 },
       },
       vertexShader: `
         varying vec3 vNormalView;
@@ -220,8 +438,8 @@ export class VFXManager {
         varying vec3 vViewPos;
         varying vec2 vUv;
         void main() {
-          vec3 viewDir = normalize(vViewPos);
-          float fresnel = pow(abs(dot(vNormalView, viewDir)), 1.6);
+          vec3 viewDir = normalize(vViewPos + vec3(0.0, 0.0, 1e-5));
+          float fresnel = pow(max(abs(dot(normalize(vNormalView + vec3(0.0, 1e-5, 0.0)), viewDir)), 0.0001), 1.6);
           float distFade = smoothstep(0.0, 0.25, vUv.y) * (1.0 - smoothstep(0.35, 1.0, vUv.y));
           float alpha = fresnel * distFade * uOpacity;
           gl_FragColor = vec4(uColor, alpha);
@@ -234,7 +452,7 @@ export class VFXManager {
     return mesh;
   }
 
-  /** Vertical light shaft + glow used to mark objectives (no real lights → no shader recompiles). */
+  /** Vertical light shaft + glow used to mark objectives (no real lights -> no shader recompiles). */
   public createObjectiveMarker(pos: THREE.Vector3, colorHex: number): ObjectiveMarker {
     const group = new THREE.Group();
     group.position.copy(pos);
@@ -247,7 +465,7 @@ export class VFXManager {
       uniforms: { uColor: { value: new THREE.Color(colorHex) }, uOpacity: { value: 0.55 } },
       vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
       fragmentShader: `uniform vec3 uColor; uniform float uOpacity; varying vec2 vUv;
-        void main(){ float a = pow(1.0 - vUv.y, 1.6) * (0.55 + 0.45 * sin(vUv.x * 6.2831)); gl_FragColor = vec4(uColor, a * uOpacity); }`,
+        void main(){ float a = pow(max(1.0 - vUv.y, 0.0001), 1.6) * (0.55 + 0.45 * sin(vUv.x * 6.2831)); gl_FragColor = vec4(uColor, a * uOpacity); }`,
     });
     const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.42, 9, 16, 1, true), beamMat);
     beam.position.y = 4.5;
@@ -280,38 +498,45 @@ export class VFXManager {
 
   public spawnMuzzleFlash(origin: THREE.Vector3, direction: THREE.Vector3, big = false): void {
     this.muzzleLight.position.copy(origin);
-    this.muzzleLight.intensity = big ? 9 : 6.5;
-    this.muzzleLightTimer = 0.055;
+    this.muzzleLight.intensity = big ? 11 : 7.5;
+    this.muzzleLightTimer = big ? 0.07 : 0.055;
 
     const tex = this.tex('vfx_muzzle_01', 'vfx_muzzle_02', 'vfx_muzzle_04');
-    const mat = new THREE.SpriteMaterial({
-      map: tex,
-      color: 0xffc857,
-      transparent: true,
-      opacity: 0.95,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      rotation: Math.random() * Math.PI,
-    });
-    const sprite = new THREE.Sprite(mat);
-    sprite.position.copy(origin).addScaledVector(direction, 0.12);
-    const s = big ? 0.9 : 0.6;
-    sprite.scale.setScalar(s);
-    this.scene.add(sprite);
-    this.particles.push({
-      sprite,
-      velocity: direction.clone().multiplyScalar(2),
-      age: 0,
-      lifetime: 0.06,
-      startScale: s,
-      endScale: s * 0.3,
-      gravity: 0,
-      baseOpacity: 0.95,
-      drag: 0,
-    });
+    const s = big ? 0.98 : 0.64;
+    this.emit(
+      tex,
+      0xffcf6e,
+      origin.clone().addScaledVector(direction, 0.12),
+      direction.clone().multiplyScalar(2),
+      s,
+      s * 0.28,
+      0.06,
+      0.95,
+      true
+    );
+
+    // Hot incandescent core star + fast sparks on heavy weapons
+    if (big) {
+      this.emit(this.tex('vfx_star_06'), 0xfff3cc, origin.clone().addScaledVector(direction, 0.1), new THREE.Vector3(), 0.7, 0.15, 0.055, 0.9, true);
+      for (let i = 0; i < 4; i++) {
+        const sv = direction
+          .clone()
+          .multiplyScalar(5 + Math.random() * 4)
+          .add(new THREE.Vector3((Math.random() - 0.5) * 2.4, (Math.random() - 0.5) * 1.8, (Math.random() - 0.5) * 2.4));
+        this.emit(this.tex('vfx_spark_01', 'vfx_spark_04'), 0xffc864, origin, sv, 0.14, 0.03, 0.14, 0.9, true, 8);
+      }
+    }
 
     // Lingering gun smoke
-    this.spawnPuff(origin.clone().addScaledVector(direction, 0.25), direction.clone().multiplyScalar(0.8), 0x9ca3af, 0.18, big ? 0.9 : 0.55, 0.25);
+    this.spawnPuff(
+      origin.clone().addScaledVector(direction, 0.25),
+      direction.clone().multiplyScalar(0.85),
+      0xa1a8b3,
+      0.18,
+      big ? 1.05 : 0.6,
+      0.26,
+      0.75
+    );
   }
 
   private spawnPuff(
@@ -323,47 +548,137 @@ export class VFXManager {
     opacity: number,
     lifetime = 0.7
   ): void {
-    const mat = new THREE.SpriteMaterial({
-      map: this.tex('vfx_smoke_01', 'vfx_smoke_04', 'vfx_smoke_07'),
+    this.emit(
+      this.tex('vfx_smoke_01', 'vfx_smoke_04', 'vfx_smoke_07'),
       color,
-      transparent: true,
-      opacity,
-      depthWrite: false,
-      rotation: Math.random() * Math.PI * 2,
-    });
-    const sprite = new THREE.Sprite(mat);
-    sprite.position.copy(pos);
-    sprite.scale.setScalar(startScale);
-    this.scene.add(sprite);
-    this.particles.push({
-      sprite,
-      velocity: vel.add(new THREE.Vector3(0, 0.35, 0)),
-      age: 0,
-      lifetime,
+      pos,
+      vel.clone().add(new THREE.Vector3(0, 0.35, 0)),
       startScale,
       endScale,
-      gravity: -0.2,
-      baseOpacity: opacity,
-      drag: 2.2,
-    });
+      lifetime,
+      opacity,
+      false,
+      -0.2,
+      2.2,
+      (Math.random() - 0.5) * 1.2
+    );
+  }
+
+  /** Footstep dust/mud/water spray under the player's boots. */
+  public spawnFootstepPuff(pos: THREE.Vector3, surface: Surface, wetness: number, sprinting: boolean): void {
+    if (!this.highQuality && !sprinting) return;
+    const basePos = pos.clone().setY(0.11);
+    if (wetness > 0.28 && surface !== 'wood') {
+      // Wet asphalt / puddle spray
+      const count = sprinting ? 4 : 2;
+      for (let i = 0; i < count; i++) {
+        this.emit(
+          this.softTex,
+          0xc8d9ea,
+          basePos,
+          new THREE.Vector3((Math.random() - 0.5) * 1.4, 0.7 + Math.random() * 1.1, (Math.random() - 0.5) * 1.4),
+          0.08,
+          0.22,
+          0.28,
+          0.35 * wetness,
+          false,
+          7.5,
+          1.2
+        );
+      }
+      return;
+    }
+    const color = surface === 'grass' ? 0x5c6844 : surface === 'wood' ? 0x8b7258 : 0x9c9891;
+    this.emit(
+      this.tex('vfx_smoke_01', 'vfx_dirt_01'),
+      color,
+      basePos,
+      new THREE.Vector3((Math.random() - 0.5) * 0.5, 0.25 + (sprinting ? 0.25 : 0), (Math.random() - 0.5) * 0.5),
+      sprinting ? 0.18 : 0.11,
+      sprinting ? 0.55 : 0.32,
+      sprinting ? 0.48 : 0.34,
+      sprinting ? 0.28 : 0.16,
+      false,
+      0.2,
+      2.5
+    );
+  }
+
+  /** Air & dust burst kicked up on tactical dodge dash. */
+  public spawnDodgeBurst(pos: THREE.Vector3, moveDir: THREE.Vector3): void {
+    const p = pos.clone().setY(0.25);
+    const back = moveDir.clone().negate();
+    for (let i = 0; i < 6; i++) {
+      const vel = back
+        .clone()
+        .multiplyScalar(1.4 + Math.random() * 1.8)
+        .add(new THREE.Vector3((Math.random() - 0.5) * 1.3, 0.35 + Math.random() * 0.6, (Math.random() - 0.5) * 1.3));
+      this.emit(this.tex('vfx_smoke_01', 'vfx_smoke_04'), 0xb8b2a8, p, vel, 0.25, 0.95, 0.45, 0.32, false, -0.1, 2.4);
+    }
+  }
+
+  /** Translucent crescent slash arc for Fire Axe melee swings. */
+  public spawnMeleeSlash(origin: THREE.Vector3, forward: THREE.Vector3): void {
+    const arc = this.slashPool[this.slashCursor];
+    this.slashCursor = (this.slashCursor + 1) % SLASH_POOL_SIZE;
+    arc.active = true;
+    arc.age = 0;
+    arc.lifetime = 0.16;
+    arc.mesh.position.copy(origin).add(new THREE.Vector3(0, 0.95, 0)).addScaledVector(forward, 0.35);
+    arc.mesh.rotation.set(0.18, Math.atan2(forward.x, forward.z), (Math.random() - 0.5) * 0.3);
+    arc.mesh.scale.setScalar(0.85);
+    arc.mat.opacity = 0.72;
+    arc.mesh.visible = true;
+  }
+
+  /** Flying wood splinters + dust when barricades are hammered, pounded, or shattered. */
+  public spawnWoodSplinters(pos: THREE.Vector3, normal: THREE.Vector3, count = 8, isMetal = false): void {
+    const tex = isMetal ? this.tex('vfx_spark_01', 'vfx_spark_04') : this.tex('vfx_dirt_01', 'vfx_dirt_03');
+    for (let i = 0; i < count; i++) {
+      const vel = normal
+        .clone()
+        .multiplyScalar(1.5 + Math.random() * 2.8)
+        .add(new THREE.Vector3((Math.random() - 0.5) * 2.6, 0.9 + Math.random() * 2.2, (Math.random() - 0.5) * 2.6));
+      this.emit(
+        tex,
+        isMetal ? 0xfbbf24 : i % 2 === 0 ? 0x9c6e44 : 0x5c3e24,
+        pos.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4)),
+        vel,
+        0.13 + Math.random() * 0.12,
+        0.05,
+        0.4 + Math.random() * 0.25,
+        0.92,
+        isMetal,
+        12,
+        0.5,
+        (Math.random() - 0.5) * 8
+      );
+    }
+    this.spawnPuff(pos, normal.clone().multiplyScalar(0.7), isMetal ? 0xcbd5e1 : 0xa38b72, 0.2, 0.75, 0.32, 0.55);
+  }
+
+  /** Subtle rising sparkle burst on item pickup or healing. */
+  public spawnPickupBurst(pos: THREE.Vector3, colorHex: number): void {
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      const vel = new THREE.Vector3(Math.cos(a) * 0.9, 1.4 + Math.random() * 1.1, Math.sin(a) * 0.9);
+      this.emit(this.tex('vfx_star_06', 'vfx_light_01'), colorHex, pos.clone().setY(pos.y + 0.4), vel, 0.2, 0.04, 0.55, 0.85, true, -0.4, 1.4);
+    }
   }
 
   public spawnTracer(start: THREE.Vector3, end: THREE.Vector3): void {
     const dist = start.distanceTo(end);
     if (dist < 0.3) return;
-    const mat = new THREE.MeshBasicMaterial({
-      color: 0xffe9a8,
-      transparent: true,
-      opacity: 0.8,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    });
-    const mesh = new THREE.Mesh(this.tracerGeo, mat);
-    mesh.position.copy(start).lerp(end, 0.5);
-    mesh.scale.set(0.012, 0.012, dist);
-    mesh.lookAt(end);
-    this.scene.add(mesh);
-    this.tracers.push({ mesh, age: 0, lifetime: 0.06 });
+    const tr = this.tracerPool[this.tracerCursor];
+    this.tracerCursor = (this.tracerCursor + 1) % TRACER_POOL_SIZE;
+    tr.active = true;
+    tr.age = 0;
+    tr.lifetime = 0.06;
+    tr.mat.opacity = 0.85;
+    tr.mesh.position.copy(start).lerp(end, 0.5);
+    tr.mesh.scale.set(0.013, 0.013, dist);
+    tr.mesh.lookAt(end);
+    tr.mesh.visible = true;
   }
 
   public spawnShellCasing(origin: THREE.Vector3, rightDir: THREE.Vector3): void {
@@ -393,77 +708,59 @@ export class VFXManager {
 
   public spawnBloodBurst(pos: THREE.Vector3, normalDir: THREE.Vector3, count = 10): void {
     const tex = this.tex('vfx_dirt_01', 'vfx_dirt_03');
-    for (let i = 0; i < count; i++) {
-      const mat = new THREE.SpriteMaterial({
-        map: i % 2 === 0 ? tex : this.softTex,
-        color: i % 3 === 0 ? 0x5b0a0a : 0x9b1111,
-        transparent: true,
-        opacity: 0.95,
-        depthWrite: false,
-        rotation: Math.random() * Math.PI * 2,
-      });
-      const sprite = new THREE.Sprite(mat);
-      sprite.position.copy(pos);
+    const n = this.highQuality ? count : Math.max(4, Math.round(count * 0.6));
+    for (let i = 0; i < n; i++) {
       const scale = 0.14 + Math.random() * 0.22;
-      sprite.scale.setScalar(scale);
-      this.scene.add(sprite);
-
       const vel = normalDir
         .clone()
-        .multiplyScalar(1.5 + Math.random() * 3)
+        .multiplyScalar(1.6 + Math.random() * 3.1)
         .add(new THREE.Vector3((Math.random() - 0.5) * 2.6, 0.8 + Math.random() * 2.2, (Math.random() - 0.5) * 2.6));
-
-      this.particles.push({
-        sprite,
-        velocity: vel,
-        age: 0,
-        lifetime: 0.35 + Math.random() * 0.3,
-        startScale: scale,
-        endScale: scale * 1.6,
-        gravity: 12,
-        baseOpacity: 0.95,
-        drag: 0.6,
-      });
+      this.emit(
+        i % 2 === 0 ? tex : this.softTex,
+        i % 3 === 0 ? 0x5b0a0a : 0x9b1111,
+        pos,
+        vel,
+        scale,
+        scale * 1.6,
+        0.35 + Math.random() * 0.3,
+        0.95,
+        false,
+        12,
+        0.6
+      );
     }
-    // Fine mist
-    this.spawnPuff(pos.clone(), normalDir.clone().multiplyScalar(0.6), 0x7f1d1d, 0.25, 0.9, 0.45, 0.45);
+    // Crimson aerosol mist
+    this.spawnPuff(pos.clone(), normalDir.clone().multiplyScalar(0.6), 0x7f1d1d, 0.25, 0.95, 0.45, 0.48);
   }
 
-  public spawnImpactSparks(pos: THREE.Vector3, normal: THREE.Vector3): void {
+  public spawnImpactSparks(pos: THREE.Vector3, normal: THREE.Vector3, isMetal = false): void {
     const tex = this.tex('vfx_spark_01', 'vfx_spark_04');
-    for (let i = 0; i < 6; i++) {
-      const mat = new THREE.SpriteMaterial({
-        map: tex,
-        color: 0xfbbf24,
-        transparent: true,
-        opacity: 0.9,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      const sprite = new THREE.Sprite(mat);
-      sprite.position.copy(pos);
-      sprite.scale.setScalar(0.16);
-      this.scene.add(sprite);
-
+    const count = isMetal ? 9 : 6;
+    for (let i = 0; i < count; i++) {
       const vel = normal
         .clone()
-        .multiplyScalar(2 + Math.random() * 3)
-        .add(new THREE.Vector3((Math.random() - 0.5) * 3, Math.random() * 2.5, (Math.random() - 0.5) * 3));
-
-      this.particles.push({
-        sprite,
-        velocity: vel,
-        age: 0,
-        lifetime: 0.18 + Math.random() * 0.15,
-        startScale: 0.18,
-        endScale: 0.03,
-        gravity: 9.8,
-        baseOpacity: 0.9,
-        drag: 0,
-      });
+        .multiplyScalar((isMetal ? 3.2 : 2) + Math.random() * 3.2)
+        .add(new THREE.Vector3((Math.random() - 0.5) * 3.2, Math.random() * 2.6, (Math.random() - 0.5) * 3.2));
+      this.emit(tex, isMetal ? 0xffe082 : 0xfbbf24, pos, vel, 0.18, 0.03, 0.18 + Math.random() * 0.16, 0.92, true, 9.8);
     }
-    // Concrete dust puff
-    this.spawnPuff(pos.clone().addScaledVector(normal, 0.05), normal.clone().multiplyScalar(0.9), 0xa8a29e, 0.15, 0.7, 0.4, 0.6);
+    this.spawnPuff(pos.clone().addScaledVector(normal, 0.05), normal.clone().multiplyScalar(0.9), isMetal ? 0x94a3b8 : 0xa8a29e, 0.15, 0.72, 0.4, 0.6);
+    this.spawnBulletHole(pos, normal, isMetal);
+  }
+
+  /** Persistent bullet impact decal oriented flush against walls, streets, or vehicles (capped). */
+  public spawnBulletHole(pos: THREE.Vector3, normal: THREE.Vector3, isMetal = false): void {
+    if (pos.y < -5) return; // ignore shader warm-up
+    const mesh = new THREE.Mesh(this.holeGeo, isMetal ? this.holeMatMetal : this.holeMatDark);
+    mesh.position.copy(pos).addScaledVector(normal, 0.015);
+    mesh.lookAt(pos.clone().add(normal));
+    mesh.rotateZ(Math.random() * Math.PI * 2);
+    mesh.scale.setScalar(0.85 + Math.random() * 0.45);
+    mesh.renderOrder = 2;
+    this.scene.add(mesh);
+    this.bulletHoles.push(mesh);
+    if (this.bulletHoles.length > 48) {
+      this.scene.remove(this.bulletHoles.shift()!);
+    }
   }
 
   /** Persistent blood pool on the ground (capped). */
@@ -490,85 +787,53 @@ export class VFXManager {
     const tex = isSmoke
       ? this.tex('vfx_smoke_01', 'vfx_smoke_04')
       : this.tex('vfx_flame_02', 'vfx_flame_03', 'vfx_flame_05', 'vfx_fire_01');
-
-    const mat = new THREE.SpriteMaterial({
-      map: tex,
-      color: isSmoke ? 0x3f3f46 : Math.random() < 0.5 ? 0xf97316 : 0xfacc15,
-      transparent: true,
-      opacity: isSmoke ? 0.35 : 0.85,
-      blending: isSmoke ? THREE.NormalBlending : THREE.AdditiveBlending,
-      depthWrite: false,
-      rotation: Math.random() * Math.PI * 2,
-    });
-
-    const sprite = new THREE.Sprite(mat);
-    sprite.position.set(
-      pos.x + (Math.random() - 0.5) * 0.35,
-      pos.y + 0.15,
-      pos.z + (Math.random() - 0.5) * 0.35
+    const scale = (isSmoke ? 0.55 : 0.36) * intensity;
+    const p = new THREE.Vector3(pos.x + (Math.random() - 0.5) * 0.35, pos.y + 0.15, pos.z + (Math.random() - 0.5) * 0.35);
+    const vel = new THREE.Vector3((Math.random() - 0.5) * 0.45, (isSmoke ? 1.4 : 1.95) * intensity, (Math.random() - 0.5) * 0.45);
+    this.emit(
+      tex,
+      isSmoke ? 0x3f3f46 : Math.random() < 0.5 ? 0xf97316 : 0xfacc15,
+      p,
+      vel,
+      scale,
+      isSmoke ? scale * 2.6 : scale * 0.2,
+      isSmoke ? 1.4 : 0.55 + Math.random() * 0.35,
+      isSmoke ? 0.32 : 0.88,
+      !isSmoke,
+      -0.3
     );
-    const scale = (isSmoke ? 0.55 : 0.35) * intensity;
-    sprite.scale.setScalar(scale);
-    this.scene.add(sprite);
 
-    this.particles.push({
-      sprite,
-      velocity: new THREE.Vector3(
-        (Math.random() - 0.5) * 0.45,
-        (isSmoke ? 1.4 : 1.9) * intensity,
-        (Math.random() - 0.5) * 0.45
-      ),
-      age: 0,
-      lifetime: isSmoke ? 1.4 : 0.55 + Math.random() * 0.35,
-      startScale: scale,
-      endScale: isSmoke ? scale * 2.6 : scale * 0.2,
-      gravity: -0.3,
-      baseOpacity: isSmoke ? 0.32 : 0.85,
-      drag: 0,
-    });
+    // Occasional floating glowing ember cinder
+    if (Math.random() < 0.28) {
+      this.emit(
+        this.tex('vfx_spark_01'),
+        0xffa733,
+        p,
+        new THREE.Vector3((Math.random() - 0.5) * 1.1, 2.2 + Math.random() * 1.4, (Math.random() - 0.5) * 1.1),
+        0.1,
+        0.02,
+        1.1 + Math.random() * 0.6,
+        0.95,
+        true,
+        -0.4,
+        0.4
+      );
+    }
   }
 
   /** Big fiery explosion: flash, fireball, sparks, debris, rising smoke and a scorch mark. */
   public spawnExplosion(pos: THREE.Vector3, scale = 1): void {
     this.blastLight.position.copy(pos).add(new THREE.Vector3(0, 1.2, 0));
     this.blastLightLevel = 1;
-
-    const add = (
-      tex: THREE.Texture,
-      color: number,
-      p: THREE.Vector3,
-      vel: THREE.Vector3,
-      s0: number,
-      s1: number,
-      life: number,
-      opacity: number,
-      additive: boolean,
-      gravity = 0,
-      drag = 0
-    ) => {
-      const mat = new THREE.SpriteMaterial({
-        map: tex,
-        color,
-        transparent: true,
-        opacity,
-        depthWrite: false,
-        blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
-        rotation: Math.random() * Math.PI * 2,
-      });
-      const sprite = new THREE.Sprite(mat);
-      sprite.position.copy(p);
-      sprite.scale.setScalar(s0);
-      this.scene.add(sprite);
-      this.particles.push({ sprite, velocity: vel, age: 0, lifetime: life, startScale: s0, endScale: s1, gravity, baseOpacity: opacity, drag });
-    };
     const rnd = (k: number) => (Math.random() - 0.5) * k;
 
     // Core flash
-    add(this.tex('vfx_star_06'), 0xffe2a8, pos.clone().setY(pos.y + 1), new THREE.Vector3(), 1.4 * scale, 4.5 * scale, 0.14, 0.9, true);
+    this.emit(this.tex('vfx_star_06'), 0xffe2a8, pos.clone().setY(pos.y + 1), new THREE.Vector3(), 1.5 * scale, 4.8 * scale, 0.14, 0.95, true);
+
     // Fireball
     for (let i = 0; i < 14; i++) {
       const dir = new THREE.Vector3(rnd(2), Math.random() * 1.4 + 0.2, rnd(2)).normalize();
-      add(
+      this.emit(
         this.tex('vfx_flame_02', 'vfx_flame_03', 'vfx_flame_05', 'vfx_fire_01'),
         [0xffb347, 0xff7a1a, 0xffd36b][i % 3],
         pos.clone().add(new THREE.Vector3(rnd(0.6), 0.6 + Math.random() * 0.6, rnd(0.6))),
@@ -582,10 +847,11 @@ export class VFXManager {
         3
       );
     }
+
     // Sparks & debris
-    for (let i = 0; i < 26; i++) {
+    for (let i = 0; i < 24; i++) {
       const dir = new THREE.Vector3(rnd(2), Math.random() * 1.2 + 0.4, rnd(2)).normalize();
-      add(
+      this.emit(
         this.tex('vfx_spark_01', 'vfx_spark_04'),
         i % 4 === 0 ? 0x3a3530 : 0xffc56b,
         pos.clone().setY(pos.y + 0.8),
@@ -598,9 +864,10 @@ export class VFXManager {
         14
       );
     }
+
     // Rolling smoke column
     for (let i = 0; i < 12; i++) {
-      add(
+      this.emit(
         this.tex('vfx_smoke_01', 'vfx_smoke_04', 'vfx_smoke_07'),
         i < 4 ? 0x2b2622 : 0x4a4540,
         pos.clone().add(new THREE.Vector3(rnd(1.5), 0.8 + Math.random(), rnd(1.5))),
@@ -611,11 +878,13 @@ export class VFXManager {
         0.55,
         false,
         -0.25,
-        0.6
+        0.6,
+        (Math.random() - 0.5) * 0.9
       );
     }
+
     // Ground shockwave ring
-    add(this.tex('vfx_circle_05'), 0xffd9a0, pos.clone().setY(0.3), new THREE.Vector3(), 0.5, 9 * scale, 0.3, 0.6, true);
+    this.emit(this.tex('vfx_circle_05'), 0xffd9a0, pos.clone().setY(0.3), new THREE.Vector3(), 0.5, 9.5 * scale, 0.3, 0.65, true);
     this.spawnScorch(pos, 3.2 * scale);
   }
 
@@ -631,7 +900,7 @@ export class VFXManager {
       polygonOffsetFactor: -2,
     });
     const m = new THREE.Mesh(this.scorchGeo, mat);
-    m.position.set(pos.x, pos.y < -5 ? pos.y : 0.075, pos.z); // (shader warm-up spawns far below the map)
+    m.position.set(pos.x, pos.y < -5 ? pos.y : 0.075, pos.z);
     m.rotation.y = Math.random() * Math.PI * 2;
     m.scale.setScalar(size);
     m.renderOrder = 1;
@@ -667,14 +936,15 @@ export class VFXManager {
   }
 
   private updateRain(dt: number, focus: THREE.Vector3): void {
-    this.rainMat.opacity = 0.24 * this.rainAmount;
+    this.rainMat.opacity = 0.25 * this.rainAmount;
     if (this.rainAmount <= 0.01) return;
     const pos = this.rain.geometry.getAttribute('position') as THREE.BufferAttribute;
     const a = pos.array as Float32Array;
     const fall = 22 * dt;
     const drift = 3 * dt;
     const half = RAIN_RANGE / 2;
-    for (let i = 0; i < RAIN_COUNT; i++) {
+    const count = this.highQuality ? RAIN_COUNT : Math.floor(RAIN_COUNT * 0.5);
+    for (let i = 0; i < count; i++) {
       const o = i * 6;
       let x = a[o] + drift;
       let y = a[o + 1] - fall;
@@ -694,25 +964,22 @@ export class VFXManager {
     pos.needsUpdate = true;
 
     // Splash rings near the player
-    const m = new THREE.Matrix4();
-    const spawn = Math.floor(90 * this.rainAmount * dt + Math.random());
+    const m = this.tmpMat4;
+    const spawn = Math.floor((this.highQuality ? 95 : 45) * this.rainAmount * dt + Math.random());
     for (let k = 0; k < spawn; k++) {
       const i = this.splashCursor++ % this.splashLife.length;
       this.splashLife[i] = 0.35;
       m.makeTranslation(focus.x + (Math.random() - 0.5) * 16, 0.08, focus.z + (Math.random() - 0.5) * 16);
       this.splashes.setMatrixAt(i, m);
     }
-    const tmp = new THREE.Vector3();
-    const q = new THREE.Quaternion();
-    const sc = new THREE.Vector3();
     for (let i = 0; i < this.splashLife.length; i++) {
       if (this.splashLife[i] <= 0) continue;
       this.splashLife[i] -= dt;
       this.splashes.getMatrixAt(i, m);
-      m.decompose(tmp, q, sc);
+      m.decompose(this.tmpVec3, this.tmpQuat, this.tmpScale);
       const t = Math.max(0, this.splashLife[i]) / 0.35;
       const s = t > 0 ? 0.6 + (1 - t) * 1.8 : 0;
-      m.compose(tmp, q, sc.set(s, s, s));
+      m.compose(this.tmpVec3, this.tmpQuat, this.tmpScale.set(s, s, s));
       this.splashes.setMatrixAt(i, m);
     }
     this.splashes.instanceMatrix.needsUpdate = true;
@@ -722,7 +989,7 @@ export class VFXManager {
     this.casingSoundCooldown = Math.max(0, this.casingSoundCooldown - dt);
     if (this.blastLightLevel > 0) {
       this.blastLightLevel = Math.max(0, this.blastLightLevel - dt * 2.2);
-      this.blastLight.intensity = 40 * this.blastLightLevel * this.blastLightLevel;
+      this.blastLight.intensity = 44 * this.blastLightLevel * this.blastLightLevel;
     }
     if (focus) this.updateRain(dt, focus);
     if (this.muzzleLightTimer > 0) {
@@ -730,6 +997,16 @@ export class VFXManager {
       if (this.muzzleLightTimer <= 0) {
         this.muzzleLight.intensity = 0;
       }
+    }
+
+    // Drifting ground fog wisps (subtle during day, rich atmospheric blankets at dusk/night/rain)
+    const fogAlpha = 0.025 + this.nightAmount * 0.055 + this.rainAmount * 0.04;
+    for (let i = 0; i < this.fogWisps.length; i++) {
+      const w = this.fogWisps[i];
+      if (!w.sprite.visible) continue;
+      w.sprite.position.x = w.basePos.x + Math.sin(elapsed * 0.14 * w.speed + w.phase) * 7;
+      w.sprite.position.z = w.basePos.z + Math.cos(elapsed * 0.11 * w.speed + w.phase) * 6;
+      w.mat.opacity = fogAlpha * (0.7 + 0.3 * Math.sin(elapsed * 0.4 + w.phase));
     }
 
     // Falling ash wraps around the focus point
@@ -765,19 +1042,19 @@ export class VFXManager {
     for (const emitter of this.fireEmitters) {
       emitter.timer -= dt;
       if (emitter.timer <= 0) {
-        emitter.timer = 0.08 + Math.random() * 0.06;
+        emitter.timer = (this.highQuality ? 0.08 : 0.13) + Math.random() * 0.06;
         this.spawnEmber(emitter.position, emitter.intensity);
       }
     }
 
-    // Update particles
-    for (let i = this.particles.length - 1; i >= 0; i--) {
-      const p = this.particles[i];
+    // Update pooled sprite particles
+    for (let i = 0; i < PARTICLE_POOL_SIZE; i++) {
+      const p = this.pool[i];
+      if (!p.active) continue;
       p.age += dt;
       if (p.age >= p.lifetime) {
-        this.scene.remove(p.sprite);
-        p.sprite.material.dispose();
-        this.particles.splice(i, 1);
+        p.active = false;
+        p.sprite.visible = false;
         continue;
       }
       const t = p.age / p.lifetime;
@@ -788,21 +1065,38 @@ export class VFXManager {
         p.sprite.position.y = 0.05;
         p.velocity.set(0, 0, 0);
       }
+      if (p.rotSpeed !== 0) p.mat.rotation += p.rotSpeed * dt;
       const scale = THREE.MathUtils.lerp(p.startScale, p.endScale, t);
       p.sprite.scale.setScalar(scale);
-      p.sprite.material.opacity = p.baseOpacity * (1 - t);
+      p.mat.opacity = p.baseOpacity * (1 - t);
     }
 
-    // Update tracers
-    for (let i = this.tracers.length - 1; i >= 0; i--) {
-      const tr = this.tracers[i];
+    // Update pooled tracers
+    for (let i = 0; i < TRACER_POOL_SIZE; i++) {
+      const tr = this.tracerPool[i];
+      if (!tr.active) continue;
       tr.age += dt;
       if (tr.age >= tr.lifetime) {
-        this.scene.remove(tr.mesh);
-        (tr.mesh.material as THREE.Material).dispose();
-        this.tracers.splice(i, 1);
+        tr.active = false;
+        tr.mesh.visible = false;
       } else {
-        (tr.mesh.material as THREE.MeshBasicMaterial).opacity = 0.8 * (1 - tr.age / tr.lifetime);
+        tr.mat.opacity = 0.85 * (1 - tr.age / tr.lifetime);
+      }
+    }
+
+    // Update melee slash arcs
+    for (let i = 0; i < SLASH_POOL_SIZE; i++) {
+      const arc = this.slashPool[i];
+      if (!arc.active) continue;
+      arc.age += dt;
+      if (arc.age >= arc.lifetime) {
+        arc.active = false;
+        arc.mesh.visible = false;
+      } else {
+        const t = arc.age / arc.lifetime;
+        arc.mesh.rotation.y += dt * 11;
+        arc.mesh.scale.setScalar(0.85 + t * 0.55);
+        arc.mat.opacity = 0.72 * (1 - t);
       }
     }
 

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { AssetManager } from '../core/AssetManager';
 import { AudioManager } from '../core/AudioManager';
+import { applySilhouetteRim } from '../core/EnvironmentFX';
 import { ZombieInstance, ZombieManager } from './ZombieManager';
 
 const CLIP_MAP: Record<string, string> = {
@@ -33,6 +34,7 @@ export class DogCompanion {
     this.group = assets.cloneModel('dog_shepherd');
     this.group.position.copy(spawnPos).setY(0.06);
     this.group.rotation.y = Math.PI * 0.8;
+    applySilhouetteRim(this.group, 0xfde68a, 0.45, 3.0);
     scene.add(this.group);
 
     const clips = assets.getClips('dog_shepherd');

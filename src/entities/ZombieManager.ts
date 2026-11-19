@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
 import { AssetManager } from '../core/AssetManager';
 import { AudioManager } from '../core/AudioManager';
+import { applySilhouetteRim } from '../core/EnvironmentFX';
 import { VFXManager } from '../core/VFXManager';
 import { ZombieAIState, ZombieArchetype } from '../types/game';
 import { BarricadeInstance } from '../world/CityGenerator';
@@ -247,6 +248,11 @@ export class ZombieManager {
         meshes.push(m);
       }
     });
+
+    // Subtle Fresnel silhouette rim for readability in midnight fog & rain
+    const rimHex = opts.boss ? 0xef4444 : archetype === 'brute' ? 0xf87171 : archetype === 'sprinter' ? 0xfca5a5 : 0x99f6e4;
+    const rimStr = opts.boss ? 0.85 : archetype === 'brute' ? 0.62 : archetype === 'sprinter' ? 0.5 : 0.36;
+    applySilhouetteRim(group, rimHex, rimStr, 3.1);
 
     // Invisible hitbox: SkinnedMesh raycasts use a stale bind-pose bounding sphere (missed shots)
     // and are expensive. A simple shape in the zombie's local space is reliable and cheap.
@@ -701,6 +707,8 @@ export class ZombieManager {
               z.attackCooldown = 1.3;
               b.hp -= z.damage * (z.archetype === 'brute' ? 1.1 : 0.55); // planks ≈ 20 s vs one shambler
               this.audio.playPositional(Math.random() < 0.5 ? 'wood_hit' : 'impact_wood', b.position, 0.6, 0.15, 6);
+              const outDir = zPos.clone().sub(b.position).setY(0.2).normalize();
+              this.vfx.spawnWoodSplinters(b.position.clone().setY(1.2), outDir, 5, false);
               if (b.hp <= 0) this.onBarricadeBroken?.(b);
             }
             this.syncTransform(z, dt);

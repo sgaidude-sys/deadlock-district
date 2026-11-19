@@ -21,10 +21,10 @@ varying vec3 vDir;
 float hash(vec3 p) { return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453); }
 void main() {
   vec3 d = normalize(vDir);
-  float h = clamp(d.y, 0.0, 1.0);
+  float h = clamp(d.y, 0.0001, 1.0);
   vec3 col = mix(uHorizon, uTop, pow(h, 0.55));
   // Sun / moon glow
-  float sd = max(dot(d, normalize(uSunDir)), 0.0);
+  float sd = max(dot(d, normalize(uSunDir)), 0.0001);
   col += uSunColor * (pow(sd, 48.0) * 0.6 + pow(sd, 6.0) * 0.12) * (1.0 - uNight * 0.6) * (1.0 - uCloud * 0.85);
   // Moon disc + stars at night
   float moon = smoothstep(0.9985, 0.9992, sd) * uNight * (1.0 - uCloud);

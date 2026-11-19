@@ -80,12 +80,13 @@ export class WeatherSystem {
       }
     }
 
-    // Wet look: glossier and slightly darker. Only touch materials when it visibly changes.
+    // Wet look: glossier, slightly darker, and richer sky/streetlamp IBL reflections.
     if (Math.abs(this.wetness - this.appliedWetness) > 0.02) {
       this.appliedWetness = this.wetness;
       const w = this.wetness;
       for (const { mat, rough, color } of this.materials) {
-        mat.roughness = rough * (1 - 0.55 * w);
+        mat.roughness = rough * (1 - 0.58 * w);
+        mat.envMapIntensity = 0.65 + 0.9 * w;
         mat.color.copy(color).multiplyScalar(1 - 0.18 * w);
       }
     }

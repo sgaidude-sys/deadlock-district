@@ -4,16 +4,18 @@ import { AssetManager } from '../core/AssetManager';
 import { ObjectiveMarker, VFXManager } from '../core/VFXManager';
 import { InteractableObject } from '../types/game';
 import {
-  brickTexture,
-  concreteTexture,
+  brickPBR,
+  concretePBR,
   facadeTextures,
-  grassTexture,
-  groundTexture,
-  metalTexture,
-  roofTexture,
-  tiled,
-  woodFloorTexture,
+  grassPBR,
+  groundPBR,
+  metalPBR,
+  plankPBR,
+  roofPBR,
+  tiledPBR,
+  woodFloorPBR,
 } from './ProceduralTextures';
+import { applyWindSway } from '../core/EnvironmentFX';
 
 export interface StreetLightNode {
   light: THREE.PointLight;
@@ -156,9 +158,9 @@ export class CityGenerator {
   private truck!: TruckInfo;
   private windowMaterials: THREE.MeshStandardMaterial[] = [];
 
-  private woodMat = new THREE.MeshStandardMaterial({ color: 0x6b4a30, roughness: 0.8 });
-  private darkWoodMat = new THREE.MeshStandardMaterial({ color: 0x3d2a1c, roughness: 0.85 });
-  private metalMat = new THREE.MeshStandardMaterial({ color: 0x8b9096, roughness: 0.45, metalness: 0.5 });
+  private woodMat: THREE.MeshStandardMaterial;
+  private darkWoodMat: THREE.MeshStandardMaterial;
+  private metalMat: THREE.MeshStandardMaterial;
   private roofMat: THREE.MeshStandardMaterial;
 
   constructor(scene: THREE.Scene, physicsWorld: CANNON.World, assets: AssetManager, vfx: VFXManager) {
@@ -166,7 +168,44 @@ export class CityGenerator {
     this.physicsWorld = physicsWorld;
     this.assets = assets;
     this.vfx = vfx;
-    this.roofMat = new THREE.MeshStandardMaterial({ color: 0x9a9a9a, map: roofTexture(), roughness: 0.95 });
+
+    const plank = plankPBR();
+    const metal = metalPBR();
+    const roof = roofPBR();
+
+    this.woodMat = new THREE.MeshStandardMaterial({
+      color: 0xb89678,
+      map: plank.map,
+      normalMap: plank.normalMap,
+      roughnessMap: plank.roughnessMap,
+      normalScale: new THREE.Vector2(0.8, 0.8),
+      roughness: 0.9,
+    });
+    this.darkWoodMat = new THREE.MeshStandardMaterial({
+      color: 0x6b4f3a,
+      map: plank.map,
+      normalMap: plank.normalMap,
+      roughnessMap: plank.roughnessMap,
+      normalScale: new THREE.Vector2(0.8, 0.8),
+      roughness: 0.92,
+    });
+    this.metalMat = new THREE.MeshStandardMaterial({
+      color: 0x9aa2aa,
+      map: metal.map,
+      normalMap: metal.normalMap,
+      roughnessMap: metal.roughnessMap,
+      normalScale: new THREE.Vector2(0.7, 0.7),
+      roughness: 0.65,
+      metalness: 0.65,
+    });
+    this.roofMat = new THREE.MeshStandardMaterial({
+      color: 0xa2a4a8,
+      map: roof.map,
+      normalMap: roof.normalMap,
+      roughnessMap: roof.roughnessMap,
+      normalScale: new THREE.Vector2(0.9, 0.9),
+      roughness: 0.96,
+    });
   }
 
   /** Rescale BoxGeometry UVs so a shared tiling texture keeps a constant world-space density. */
@@ -312,9 +351,16 @@ export class CityGenerator {
     groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
     this.physicsWorld.addBody(groundBody);
 
+    const gPBR = tiledPBR(groundPBR(), 26, 26);
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(160, 160),
-      new THREE.MeshStandardMaterial({ map: tiled(groundTexture(), 26, 26), roughness: 0.97 })
+      new THREE.MeshStandardMaterial({
+        map: gPBR.map,
+        normalMap: gPBR.normalMap,
+        roughnessMap: gPBR.roughnessMap,
+        normalScale: new THREE.Vector2(0.95, 0.95),
+        roughness: 0.98,
+      })
     );
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
@@ -322,7 +368,7 @@ export class CityGenerator {
     this.raycastTargets.push(ground);
 
     // Sidewalk plazas in each quadrant (thin, so characters don't sink)
-    const concrete = concreteTexture();
+    const concrete = concretePBR();
     for (const [qx, qz] of [
       [-1, -1],
       [1, -1],
@@ -330,9 +376,16 @@ export class CityGenerator {
       [1, 1],
     ]) {
       const size = 62;
+      const cPBR = tiledPBR(concrete, size / 4, size / 4);
       const pad = new THREE.Mesh(
         new THREE.BoxGeometry(size, FLOOR_Y, size),
-        new THREE.MeshStandardMaterial({ map: tiled(concrete, size / 4, size / 4), roughness: 0.92 })
+        new THREE.MeshStandardMaterial({
+          map: cPBR.map,
+          normalMap: cPBR.normalMap,
+          roughnessMap: cPBR.roughnessMap,
+          normalScale: new THREE.Vector2(0.9, 0.9),
+          roughness: 0.94,
+        })
       );
       pad.position.set(qx * (4 + size / 2), FLOOR_Y / 2, qz * (4 + size / 2));
       pad.receiveShadow = true;
@@ -361,7 +414,15 @@ export class CityGenerator {
   private buildPerimeterWalls(): void {
     const h = 5;
     const len = 144;
-    const mat = new THREE.MeshStandardMaterial({ map: metalTexture(), roughness: 0.75, metalness: 0.3 });
+    const mPBR = metalPBR();
+    const mat = new THREE.MeshStandardMaterial({
+      map: mPBR.map,
+      normalMap: mPBR.normalMap,
+      roughnessMap: mPBR.roughnessMap,
+      normalScale: new THREE.Vector2(1.1, 1.1),
+      roughness: 0.85,
+      metalness: 0.42,
+    });
     // North wall has a 9 m gate opening for the evac truck
     const gateHalf = 4.5;
     const sideLen = (len - gateHalf * 2) / 2;
@@ -372,7 +433,15 @@ export class CityGenerator {
       this.scene.add(mesh);
       this.addStaticBox(x, h / 2, -70, sideLen, h, 2, mesh, { occludes: true, blocksSight: true });
     }
-    const gateMat = new THREE.MeshStandardMaterial({ color: 0x5b6168, roughness: 0.5, metalness: 0.6, map: metalTexture() });
+    const gateMat = new THREE.MeshStandardMaterial({
+      color: 0x626a73,
+      roughness: 0.58,
+      metalness: 0.68,
+      map: mPBR.map,
+      normalMap: mPBR.normalMap,
+      roughnessMap: mPBR.roughnessMap,
+      normalScale: new THREE.Vector2(1.1, 1.1),
+    });
     const gate = new THREE.Group();
     const panel = this.texturedBox(gateHalf * 2, h - 0.4, 0.4, gateMat, 2);
     panel.position.y = (h - 0.4) / 2;
@@ -452,9 +521,24 @@ export class CityGenerator {
   ): void {
     const h = BUILDING_H;
     const t = 0.4;
-    const mat = new THREE.MeshStandardMaterial({ color: tintHex, map: brickTexture(), roughness: 0.9 });
+    const brick = brickPBR();
+    const mat = new THREE.MeshStandardMaterial({
+      color: tintHex,
+      map: brick.map,
+      normalMap: brick.normalMap,
+      roughnessMap: brick.roughnessMap,
+      normalScale: new THREE.Vector2(1.1, 1.1),
+      roughness: 0.94,
+    });
 
-    const floorMat = new THREE.MeshStandardMaterial({ map: tiled(woodFloorTexture(), w / 3, d / 3), roughness: 0.75 });
+    const wf = tiledPBR(woodFloorPBR(), w / 3, d / 3);
+    const floorMat = new THREE.MeshStandardMaterial({
+      map: wf.map,
+      normalMap: wf.normalMap,
+      roughnessMap: wf.roughnessMap,
+      normalScale: new THREE.Vector2(0.85, 0.85),
+      roughness: 0.85,
+    });
     const floor = new THREE.Mesh(new THREE.BoxGeometry(w - 0.2, 0.02, d - 0.2), floorMat);
     floor.position.set(cx, FLOOR_Y + 0.01, cz);
     floor.receiveShadow = true;
@@ -562,7 +646,7 @@ export class CityGenerator {
 
   /** Background apartment blocks with a window facade that lights up at night. */
   private buildOuterBlocks(): void {
-    const { map, emissive } = facadeTextures();
+    const { map, normalMap, roughnessMap, emissive } = facadeTextures();
     const blocks: [number, number, number, number, number, number][] = [
       // x, z, w, d, h, tint
       [-55, -55, 18, 18, 16, 0x8f8a86],
@@ -584,10 +668,14 @@ export class CityGenerator {
       const mat = new THREE.MeshStandardMaterial({
         color: tint,
         map,
+        normalMap,
+        roughnessMap,
+        normalScale: new THREE.Vector2(1.0, 1.0),
         emissive: 0xffffff,
         emissiveMap: emissive,
         emissiveIntensity: 0,
-        roughness: 0.9,
+        roughness: 1.0,
+        metalness: 0.12,
       });
       this.windowMaterials.push(mat);
       // Box face order: +x, -x, +y (roof), -y, +z, -z
@@ -798,9 +886,16 @@ export class CityGenerator {
 
   /** NE block: an overgrown freight yard of shipping containers. */
   private buildYard(cx: number, cz: number): void {
+    const gr = tiledPBR(grassPBR(), 8, 8);
     const grass = new THREE.Mesh(
       new THREE.BoxGeometry(34, 0.02, 34),
-      new THREE.MeshStandardMaterial({ map: tiled(grassTexture(), 8, 8), roughness: 0.97 })
+      new THREE.MeshStandardMaterial({
+        map: gr.map,
+        normalMap: gr.normalMap,
+        roughnessMap: gr.roughnessMap,
+        normalScale: new THREE.Vector2(0.85, 0.85),
+        roughness: 0.98,
+      })
     );
     grass.position.set(cx, FLOOR_Y + 0.01, cz);
     grass.receiveShadow = true;
@@ -1114,6 +1209,7 @@ export class CityGenerator {
       t.position.set(x, FLOOR_Y, z);
       t.rotation.y = i * 1.7;
       t.traverse((o) => (o.castShadow = true));
+      applyWindSway(t, 0.018);
       this.scene.add(t);
       this.raycastTargets.push(t);
       this.addStaticBox(x, 2, z, 0.45, 4, 0.45);
@@ -1138,6 +1234,7 @@ export class CityGenerator {
         o.castShadow = false;
         o.receiveShadow = true;
       });
+      applyWindSway(g, key === 'nat_bush_small' ? 0.075 : 0.12);
       this.scene.add(g);
     }
   }

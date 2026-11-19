@@ -5,9 +5,11 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader.js';
 
 import { AssetManager } from './AssetManager';
-import { AudioManager, LoopHandle } from './AudioManager';
+import { AudioBus, AudioManager, LoopHandle } from './AudioManager';
+import { createUrbanEnvironmentMap, updateEnvironmentUniforms } from './EnvironmentFX';
 import { InputManager } from './InputManager';
 import { VFXManager, ObjectiveMarker } from './VFXManager';
 import { CityGenerator, CityWorldData, ExplosiveBarrel, FLOOR_Y, VehicleInstance } from '../world/CityGenerator';
@@ -27,34 +29,54 @@ const GradeShader = {
   uniforms: {
     tDiffuse: { value: null as THREE.Texture | null },
     uTime: { value: 0 },
-    uVignette: { value: 0.38 },
+    uVignette: { value: 0.36 },
     uLowHealth: { value: 0 },
     uDamage: { value: 0 },
-    uGrain: { value: 0.035 },
+    uImpact: { value: 0 },
+    uHeal: { value: 0 },
+    uGrain: { value: 0.03 },
   },
   vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
   fragmentShader: `
     uniform sampler2D tDiffuse;
-    uniform float uTime, uVignette, uLowHealth, uDamage, uGrain;
+    uniform float uTime, uVignette, uLowHealth, uDamage, uImpact, uHeal, uGrain;
     varying vec2 vUv;
     float rand(vec2 co){ return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453); }
     void main() {
       vec2 d = vUv - 0.5;
-      float ca = uDamage * 0.006 + uLowHealth * 0.0018;
+      float dist = length(d);
+      // Chromatic aberration on damage, low health, and heavy impacts/explosions
+      float ca = uDamage * 0.007 + uImpact * 0.0055 + uLowHealth * 0.002;
       vec4 c = texture2D(tDiffuse, vUv);
-      c.r = texture2D(tDiffuse, vUv + d * ca * 2.0).r;
-      c.b = texture2D(tDiffuse, vUv - d * ca * 2.0).b;
-      // Cool shadows, warm highlights
+      if (ca > 0.0002) {
+        c.r = texture2D(tDiffuse, vUv + d * ca * 2.2).r;
+        c.b = texture2D(tDiffuse, vUv - d * ca * 2.2).b;
+      }
+      // Subtle 3-tap radial zoom blur on heavy impacts / explosions
+      if (uImpact > 0.02) {
+        vec2 stepUv = d * (uImpact * 0.016);
+        vec3 rb = (
+          texture2D(tDiffuse, vUv - stepUv).rgb +
+          texture2D(tDiffuse, vUv - stepUv * 2.0).rgb
+        ) * 0.5;
+        c.rgb = mix(c.rgb, rb, clamp(uImpact * dist * 1.4, 0.0, 0.48));
+      }
+      // Filmic S-curve contrast lift + split-tone grading (cool teal shadows, warm amber highlights)
+      c.rgb = mix(c.rgb, smoothstep(vec3(0.0), vec3(1.0), c.rgb), 0.14);
       float lum = dot(c.rgb, vec3(0.299, 0.587, 0.114));
-      c.rgb = mix(c.rgb * vec3(0.93, 0.99, 1.06), c.rgb * vec3(1.04, 1.0, 0.94), smoothstep(0.2, 0.8, lum));
+      c.rgb = mix(c.rgb * vec3(0.92, 0.99, 1.07), c.rgb * vec3(1.05, 1.01, 0.94), smoothstep(0.18, 0.82, lum));
       // Desaturate as health drops
       c.rgb = mix(c.rgb, vec3(lum), uLowHealth * 0.65);
       // Vignette (tightens at low health)
-      float v = smoothstep(0.95, 0.3, length(d) * 1.3);
-      c.rgb *= mix(1.0, v, clamp(uVignette + uLowHealth * 0.4, 0.0, 1.0));
+      float v = smoothstep(0.96, 0.28, dist * 1.32);
+      c.rgb *= mix(1.0, v, clamp(uVignette + uLowHealth * 0.42, 0.0, 1.0));
       // Red pulse on damage / near death
-      float pulse = uDamage * 0.5 + uLowHealth * 0.22 * (0.5 + 0.5 * sin(uTime * 5.5));
-      c.rgb = mix(c.rgb, c.rgb * vec3(1.35, 0.55, 0.55), pulse * smoothstep(0.15, 0.75, length(d) * 1.4));
+      float pulse = uDamage * 0.52 + uLowHealth * 0.24 * (0.5 + 0.5 * sin(uTime * 5.5));
+      c.rgb = mix(c.rgb, c.rgb * vec3(1.38, 0.52, 0.52), pulse * smoothstep(0.14, 0.74, dist * 1.4));
+      // Subtle emerald heal shimmer along edges
+      if (uHeal > 0.01) {
+        c.rgb += vec3(0.08, 0.42, 0.26) * uHeal * smoothstep(0.22, 0.78, dist * 1.45);
+      }
       // Film grain
       c.rgb += (rand(vUv * 1000.0 + fract(uTime)) - 0.5) * uGrain;
       gl_FragColor = c;
@@ -76,7 +98,9 @@ export class Game {
   private scene: THREE.Scene;
   private camera: THREE.PerspectiveCamera;
   private composer: EffectComposer;
+  private bloomPass: UnrealBloomPass;
   private gradePass: ShaderPass;
+  private fxaaPass: ShaderPass;
 
   private physicsWorld: CANNON.World;
   private assets = new AssetManager();
@@ -120,6 +144,9 @@ export class Game {
   private hitMarkerTimer = 0;
   private hitKind: 'hit' | 'head' | 'kill' = 'hit';
   private damageFlashTimer = 0;
+  private impactPulse = 0;
+  private healFlashTimer = 0;
+  private chapterBanner: { chapter: number; title: string; timer: number; dur: number } | null = null;
   private damageEvents: DamageEvent[] = [];
   private toastMessage: string | null = null;
   private toastTimer = 0;
@@ -132,7 +159,15 @@ export class Game {
   private extractionInRange = true;
   private survivedSeconds = 0;
 
-  private settings = { volume: 0.8, sensitivity: 1, muted: false };
+  private settings = {
+    volume: 0.8,
+    musicVolume: 0.8,
+    sfxVolume: 0.9,
+    ambienceVolume: 0.85,
+    sensitivity: 1,
+    muted: false,
+    highQuality: true,
+  };
 
   private lastTime = performance.now();
   private elapsed = 0;
@@ -155,16 +190,25 @@ export class Game {
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.0;
+    this.renderer.toneMappingExposure = 1.02;
     this.container.appendChild(this.renderer.domElement);
 
-    // Post: bloom for muzzle flashes / fire / neon, then tone-map, then colour grade
-    this.composer = new EffectComposer(this.renderer);
+    // Procedural urban PMREM IBL reflections (makes wet asphalt, guns, vehicles & metal pop)
+    this.scene.environment = createUrbanEnvironmentMap(this.renderer);
+
+    // Post: HalfFloat HDR render target -> selective bloom -> ACES output -> cinematic grade -> FXAA
+    const rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType });
+    this.composer = new EffectComposer(this.renderer, rt);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
-    this.composer.addPass(new UnrealBloomPass(new THREE.Vector2(w, h), 0.38, 0.55, 0.82));
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.36, 0.55, 0.84);
+    this.composer.addPass(this.bloomPass);
     this.composer.addPass(new OutputPass());
     this.gradePass = new ShaderPass(GradeShader);
     this.composer.addPass(this.gradePass);
+    this.fxaaPass = new ShaderPass(FXAAShader);
+    const pr = this.renderer.getPixelRatio();
+    this.fxaaPass.uniforms['resolution'].value.set(1 / (w * pr), 1 / (h * pr));
+    this.composer.addPass(this.fxaaPass);
 
     // Lighting — the sun's shadow frustum follows the player for crisp shadows
     this.hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x2a2622, 0.85);
@@ -204,7 +248,12 @@ export class Game {
       onStartGame: (survivor) => this.startGame(survivor),
       onUseItem: (idx) => {
         if (!this.player) return;
+        const prevHp = this.player.health;
         const msg = this.inventory.useItem(idx, this.player);
+        if (this.player.health > prevHp) {
+          this.healFlashTimer = 0.65;
+          this.vfx.spawnPickupBurst(this.player.getPosition(), 0x34d399);
+        }
         if (msg) this.showToast(msg);
       },
       onCraftMedkit: () => {
@@ -232,13 +281,25 @@ export class Game {
         this.audio.setMasterVolume(v);
         this.saveSettings();
       },
+      onBusVolumeChange: (bus: AudioBus, v: number) => {
+        if (bus === 'music') this.settings.musicVolume = v;
+        else if (bus === 'sfx') this.settings.sfxVolume = v;
+        else this.settings.ambienceVolume = v;
+        this.audio.setBusVolume(bus, v);
+        this.saveSettings();
+      },
+      onQualityChange: (high: boolean) => {
+        this.settings.highQuality = high;
+        this.applyQuality();
+        this.saveSettings();
+      },
       onSensitivityChange: (v) => {
         this.settings.sensitivity = v;
         this.input.sensitivity = 0.0022 * v;
         this.saveSettings();
       },
     });
-    this.hud.setSettings(this.settings.volume, this.settings.sensitivity, this.settings.muted);
+    this.hud.setSettings(this.settings);
 
     // Interface sounds for every button in the HUD (delegated, so new buttons get them too)
     let lastHover = 0;
@@ -283,8 +344,24 @@ export class Game {
       /* storage unavailable */
     }
     this.audio.setMasterVolume(this.settings.volume);
+    this.audio.setBusVolume('music', this.settings.musicVolume);
+    this.audio.setBusVolume('sfx', this.settings.sfxVolume);
+    this.audio.setBusVolume('ambience', this.settings.ambienceVolume);
     this.audio.setMuted(this.settings.muted);
     this.input.sensitivity = 0.0022 * this.settings.sensitivity;
+    this.applyQuality();
+  }
+
+  private applyQuality(): void {
+    const high = this.settings.highQuality;
+    const { w, h } = this.viewSize();
+    const pr = Math.min(window.devicePixelRatio, high ? 1.5 : 1.0);
+    this.renderer.setPixelRatio(pr);
+    this.renderer.setSize(w, h);
+    this.composer.setSize(w, h);
+    this.fxaaPass.uniforms['resolution'].value.set(1 / (w * pr), 1 / (h * pr));
+    this.bloomPass.strength = high ? 0.36 : 0.22;
+    this.vfx.setQuality(high);
   }
 
   private saveSettings(): void {
@@ -355,6 +432,9 @@ export class Game {
     this.player.setYaw(-0.7); // face the central intersection
     this.player.setCameraOccluders(this.worldData.cameraOccluders);
     this.player.setSurfaceResolver(this.worldData.surfaceAt);
+    this.player.setOnHeavyShot((strength) => {
+      this.impactPulse = Math.max(this.impactPulse, strength);
+    });
     this.vfx.setOnCasingLand((pos) => this.audio.playPositional('casing', pos, 0.22, 0.12, 2.5));
 
     this.zombieManager = new ZombieManager(
@@ -375,7 +455,8 @@ export class Game {
       this.worldData.entries,
       this.worldData.buildings,
       this.worldData.interactables,
-      this.worldData.raycastTargets
+      this.worldData.raycastTargets,
+      this.vfx
     );
     const fort = this.fort;
     this.zombieManager.setRouter(
@@ -414,8 +495,8 @@ export class Game {
         if (weapon.id === 'shotgun' || weapon.id === 'sniper' || res.killed) this.hitStopTimer = 0.03;
         return;
       }
-      this.vfx.spawnImpactSparks(point, normal);
       const vehicleId = Game.findTag(obj, 'vehicleId');
+      this.vfx.spawnImpactSparks(point, normal, !!vehicleId);
       const now = performance.now();
       if (now - this.lastImpactSound > 50) {
         this.lastImpactSound = now;
@@ -528,10 +609,16 @@ export class Game {
     this.input.onKeyPress('KeyF', () => active() && this.player?.toggleFlashlight());
     this.input.onKeyPress('KeyV', () => active() && this.player?.swapShoulder());
     this.input.onKeyPress('KeyC', () => active() && this.player?.toggleCrouch());
+    this.input.onKeyPress('Space', () => active() && this.player?.tryDodge());
     this.input.onKeyPress('KeyR', () => active() && this.player?.startReload());
     this.input.onKeyPress('KeyQ', () => {
       if (!active() || !this.player) return;
+      const prevHp = this.player.health;
       const msg = this.inventory.useQuickMedkit(this.player);
+      if (this.player.health > prevHp) {
+        this.healFlashTimer = 0.65;
+        this.vfx.spawnPickupBurst(this.player.getPosition(), 0x34d399);
+      }
       this.showToast(msg ?? 'No Medkits or Bandages in pack!');
     });
     this.input.onKeyPress('Tab', () => {
@@ -612,6 +699,7 @@ export class Game {
 
     if (item.type === 'loot') {
       this.collect(item);
+      this.vfx.spawnPickupBurst(item.position, 0xfbbf24);
       const itemId = (item.data?.itemId as string) || 'canned_food';
       const gotText = this.inventory.pickup(itemId, this.player);
       const scrapGain = 10 + Math.floor(Math.random() * 8);
@@ -640,6 +728,7 @@ export class Game {
       if (item.id === 'crate_safehouse') this.story?.notify('lootedSafehouse');
     } else if (item.type === 'jerrycan') {
       this.collect(item);
+      this.vfx.spawnPickupBurst(item.position, 0xef4444);
       this.jerrycansCollected++;
       this.audio.playUI('loot_pickup', 0.7);
       this.audio.playObjectiveChime();
@@ -647,6 +736,7 @@ export class Game {
       this.story?.notify('jerrycan');
     } else if (item.type === 'beacon') {
       this.collect(item);
+      this.vfx.spawnPickupBurst(item.position, 0x38bdf8);
       this.beaconCollected = true;
       this.audio.playUI('loot_pickup', 0.7);
       this.audio.playObjectiveChime();
@@ -679,6 +769,8 @@ export class Game {
       }
       this.campfireCooldown = 45;
       this.player.health = Math.min(this.player.maxHealth, this.player.health + 35);
+      this.healFlashTimer = 0.75;
+      this.vfx.spawnPickupBurst(this.player.getPosition(), 0x34d399);
       this.audio.playUI('heal_sfx', 0.55);
       this.showToast('Rested by the campfire (+35 Health).');
     } else if (item.type === 'dog') {
@@ -738,8 +830,9 @@ export class Game {
     if (idx >= 0) this.worldData.raycastTargets.splice(idx, 1);
 
     this.vfx.spawnExplosion(pos);
-    this.audio.playPositional('explosion', pos, 1.0, 0.05, 14, 1.0);
-    this.audio.playPositional('explosion_low', pos, 0.9, 0.05, 18, 0.6);
+    this.audio.duck(0.6, 1.5);
+    this.audio.playPositional('explosion', pos, 1.0, 0.08, 14, 1.0);
+    this.audio.playPositional('explosion_low', pos, 0.9, 0.08, 18, 0.6);
     setTimeout(() => this.audio.playPositional('debris_fall', pos, 0.6, 0.15, 6), 350);
     this.audio.emitNoise(pos, 70);
 
@@ -752,6 +845,7 @@ export class Game {
     if (this.player) {
       const d = this.player.getPosition().distanceTo(pos);
       this.player.addTrauma(THREE.MathUtils.clamp(1.1 - d / 25, 0, 1));
+      this.impactPulse = Math.max(this.impactPulse, THREE.MathUtils.clamp(1.0 - d / 28, 0, 1));
       if (d < 6.5 && !this.gameOver) {
         this.player.takeDamage(Math.round(60 * (1 - d / 6.5)));
         this.damageFlashTimer = 0.35;
@@ -864,7 +958,7 @@ export class Game {
       onStageChanged: (stage, chapter, title) => {
         if (stage !== 'arrive') this.audio.playUI('ui_confirm', 0.5);
         if (stage === 'board') this.audio.playUI('ui_powerup', 0.7);
-        this.showToast(`CHAPTER ${chapter} — ${title.toUpperCase()}`, 3);
+        this.chapterBanner = { chapter, title, timer: 0, dur: 3.4 };
         const truck = world.interactables.find((i) => i.type === 'extraction_truck');
         if (truck && (stage === 'truck' || stage === 'board')) {
           world.extractionMarker.setActive(true);
@@ -1084,6 +1178,8 @@ export class Game {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
     this.composer.setSize(w, h);
+    const pr = this.renderer.getPixelRatio();
+    this.fxaaPass.uniforms['resolution'].value.set(1 / (w * pr), 1 / (h * pr));
   };
 
   /** Rain dims the sun and thickens the fog; lightning briefly floods the scene with light. */
@@ -1175,6 +1271,8 @@ export class Game {
       this.camera.position.set(Math.sin(a) * 38, 13 + Math.sin(this.elapsed * 0.2) * 2, Math.cos(a) * 38);
       this.camera.lookAt(this.titleLook);
       this.dayNight?.update(0, this.elapsed, this.titleLook, this.camera.position);
+      updateEnvironmentUniforms(this.elapsed, 0.15, this.dayNight?.nightFactor() ?? 0);
+      this.vfx.setAtmosphere(this.dayNight?.nightFactor() ?? 0, 0);
       this.vfx.update(dt, this.elapsed, this.camera.position);
       this.audio.update(dt, false);
       this.composer.render();
@@ -1202,7 +1300,13 @@ export class Game {
     this.spawnGraceTimer = Math.max(0, this.spawnGraceTimer - dt);
     this.hitMarkerTimer = Math.max(0, this.hitMarkerTimer - dt);
     this.damageFlashTimer = Math.max(0, this.damageFlashTimer - dt);
+    this.impactPulse = Math.max(0, this.impactPulse - dt * 3.4);
+    this.healFlashTimer = Math.max(0, this.healFlashTimer - dt);
     this.campfireCooldown = Math.max(0, this.campfireCooldown - dt);
+    if (this.chapterBanner) {
+      this.chapterBanner.timer += dt;
+      if (this.chapterBanner.timer >= this.chapterBanner.dur) this.chapterBanner = null;
+    }
     for (const ev of this.damageEvents) ev.t -= dt;
     this.damageEvents = this.damageEvents.filter((ev) => ev.t > 0);
     if (this.toastTimer > 0) {
@@ -1229,9 +1333,10 @@ export class Game {
       this.dayNight.isNight(),
       this.extractionActive,
       (dmg, from) => {
-        if (!this.player || this.gameOver || this.spawnGraceTimer > 0 || this.ending) return;
+        if (!this.player || this.gameOver || this.spawnGraceTimer > 0 || this.ending || this.player.isDodging()) return;
         this.player.takeDamage(dmg);
         this.damageFlashTimer = 0.25;
+        this.impactPulse = Math.max(this.impactPulse, 0.45);
         this.damageEvents.push({ from: from.clone(), t: 1.2 });
       }
     );
@@ -1244,17 +1349,21 @@ export class Game {
     this.dog?.update(dt, pPos, this.player.facing, this.zombieManager);
     const night = this.dayNight.nightFactor();
     this.weather.update(dt, night);
+    this.player.setWetness(this.weather.wetness);
+    updateEnvironmentUniforms(this.elapsed, this.weather.rain, night);
     this.dayNight.haze = 1 + this.weather.rain * 2.2;
     this.dayNight.cloud = Math.min(1, this.weather.rain * 1.4);
     this.dayNight.update(dt, this.elapsed, pPos, this.camera.position);
     this.applyWeatherLighting();
-    this.vfx.setRain(this.weather.rain);
+    this.vfx.setAtmosphere(night, this.weather.rain);
     this.vfx.update(dt, this.elapsed, pPos);
     this.updateWorldEvents(dt);
     this.updateGate(dt);
     this.fort?.update();
     this.story?.update(dt);
-    if (this.story?.stage === 'arrive' && this.fort?.buildingAt(pPos)?.id === 'Safehouse') this.story.notify('enteredSafehouse');
+    const currentBuilding = this.fort?.buildingAt(pPos) ?? null;
+    this.audio.setIndoors(currentBuilding !== null);
+    if (this.story?.stage === 'arrive' && currentBuilding?.id === 'Safehouse') this.story.notify('enteredSafehouse');
 
     // Audio: music follows night / being hunted / the siege; heartbeat & muffling at low health
     const hpFrac = this.player.health / this.player.maxHealth;
@@ -1272,6 +1381,8 @@ export class Game {
 
     this.gradePass.uniforms.uLowHealth.value = lowHealth;
     this.gradePass.uniforms.uDamage.value = Math.min(1, this.damageFlashTimer / 0.25);
+    this.gradePass.uniforms.uImpact.value = this.impactPulse;
+    this.gradePass.uniforms.uHeal.value = Math.min(1, this.healFlashTimer / 0.65);
 
     // Extraction siege: the clock only runs while you hold the truck
     if (this.extractionActive) {
@@ -1348,6 +1459,28 @@ export class Game {
         })(),
         rest: this.restOverlay(),
         cinematic: !!this.ending,
+        cameraYaw: this.player.yaw,
+        objectiveBearing: (() => {
+          const goal = this.story?.target();
+          if (!goal) return null;
+          const p = this.player.getPosition();
+          return Math.atan2(goal.pos.x - p.x, -(goal.pos.z - p.z));
+        })(),
+        dodgeReady: Math.max(0, 1 - this.player.dodgeCooldown / 0.85),
+        chapterBanner: this.chapterBanner
+          ? {
+              chapter: this.chapterBanner.chapter,
+              title: this.chapterBanner.title,
+              alpha:
+                this.chapterBanner.timer < 0.45
+                  ? this.chapterBanner.timer / 0.45
+                  : this.chapterBanner.timer > this.chapterBanner.dur - 0.65
+                  ? Math.max(0, (this.chapterBanner.dur - this.chapterBanner.timer) / 0.65)
+                  : 1,
+            }
+          : null,
+        healFlashTimer: this.healFlashTimer,
+        isSniperADS: this.player.isAiming && this.player.equippedWeapon.id === 'sniper',
       },
       this.input.isPointerLocked,
       dt

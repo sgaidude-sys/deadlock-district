@@ -2,7 +2,9 @@ import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
 import { AssetManager } from '../core/AssetManager';
 import { AudioManager } from '../core/AudioManager';
+import { VFXManager } from '../core/VFXManager';
 import { BarricadeInstance, BuildingInfo, EntryPoint, FLOOR_Y } from '../world/CityGenerator';
+import { metalPBR, plankPBR } from '../world/ProceduralTextures';
 import { InteractableObject } from '../types/game';
 
 /** Barricade tiers: what they cost to build/upgrade and how much punishment they take. */
@@ -39,10 +41,10 @@ export class FortificationSystem {
   public slots: EntrySlot[] = [];
   private buildings: BuildingInfo[];
 
-  private plankMat = new THREE.MeshStandardMaterial({ color: 0x7a5636, roughness: 0.85 });
-  private darkPlankMat = new THREE.MeshStandardMaterial({ color: 0x4f3622, roughness: 0.9 });
-  private sheetMat = new THREE.MeshStandardMaterial({ color: 0x7d858c, roughness: 0.45, metalness: 0.7 });
-  private nailMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.4, metalness: 0.8 });
+  private plankMat: THREE.MeshStandardMaterial;
+  private darkPlankMat: THREE.MeshStandardMaterial;
+  private sheetMat: THREE.MeshStandardMaterial;
+  private nailMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.35, metalness: 0.85 });
 
   constructor(
     private scene: THREE.Scene,
@@ -52,9 +54,37 @@ export class FortificationSystem {
     entries: EntryPoint[],
     buildings: BuildingInfo[],
     interactables: InteractableObject[],
-    private raycastTargets: THREE.Object3D[]
+    private raycastTargets: THREE.Object3D[],
+    private vfx?: VFXManager
   ) {
     this.buildings = buildings;
+    const plank = plankPBR();
+    const metal = metalPBR();
+    this.plankMat = new THREE.MeshStandardMaterial({
+      color: 0xc29a72,
+      map: plank.map,
+      normalMap: plank.normalMap,
+      roughnessMap: plank.roughnessMap,
+      normalScale: new THREE.Vector2(0.95, 0.95),
+      roughness: 0.9,
+    });
+    this.darkPlankMat = new THREE.MeshStandardMaterial({
+      color: 0x7d5a3b,
+      map: plank.map,
+      normalMap: plank.normalMap,
+      roughnessMap: plank.roughnessMap,
+      normalScale: new THREE.Vector2(0.95, 0.95),
+      roughness: 0.92,
+    });
+    this.sheetMat = new THREE.MeshStandardMaterial({
+      color: 0x8d969e,
+      map: metal.map,
+      normalMap: metal.normalMap,
+      roughnessMap: metal.roughnessMap,
+      normalScale: new THREE.Vector2(1.1, 1.1),
+      roughness: 0.55,
+      metalness: 0.72,
+    });
     // Hidden stand-ins so barricade materials are compiled with the deploy-time shader warm-up
     // instead of on the first hammer swing.
     for (const m of [this.plankMat, this.darkPlankMat, this.sheetMat, this.nailMat]) {
@@ -178,11 +208,13 @@ export class FortificationSystem {
     const p = slot.entry.position.clone().setY(1.2);
     for (let i = 0; i < 3; i++) setTimeout(() => this.audio.playPositional('hammer', p, 0.7, 0.1, 4), i * 170);
     this.audio.playPositional('wood_hit', p, 0.5, 0.1, 4);
+    this.vfx?.spawnWoodSplinters(p, slot.entry.normal, 7, slot.level >= 2);
   }
 
   /** Called when zombies (or an explosion) destroy a barricade. */
   public destroy(slot: EntrySlot, loud = true): void {
     if (!slot.barricade) return;
+    const isMetal = slot.level >= 2;
     this.physicsWorld.removeBody(slot.barricade.body);
     this.clearVisual(slot);
     slot.barricade = null;
@@ -192,7 +224,8 @@ export class FortificationSystem {
     debris.position.copy(slot.outside).setY(FLOOR_Y);
     debris.rotation.y = Math.random() * Math.PI;
     this.scene.add(debris);
-    if (loud) this.audio.playPositional('wood_break', slot.entry.position, 1.0, 0.05, 8, 0.4);
+    this.vfx?.spawnWoodSplinters(slot.entry.position.clone().setY(1.2), slot.entry.normal.clone().negate(), 16, isMetal);
+    if (loud) this.audio.playPositional('wood_break', slot.entry.position, 1.0, 0.08, 8, 0.4);
     this.refreshLabel(slot);
   }
 

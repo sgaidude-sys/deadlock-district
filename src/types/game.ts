@@ -131,4 +131,10 @@ export interface HUDState {
   bossHealth: number | null;
   rest: { clock: string; status: string } | null;
   cinematic: boolean;
+  cameraYaw: number;
+  objectiveBearing: number | null;
+  dodgeReady: number; // 0..1
+  chapterBanner: { chapter: number; title: string; alpha: number } | null;
+  healFlashTimer: number;
+  isSniperADS: boolean;
 }

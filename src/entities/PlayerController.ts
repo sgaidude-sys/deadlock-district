@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
 import { AssetManager } from '../core/AssetManager';
 import { AudioManager, Surface } from '../core/AudioManager';
+import { applySilhouetteRim } from '../core/EnvironmentFX';
 import { InputManager } from '../core/InputManager';
 import { VFXManager } from '../core/VFXManager';
 import { WEAPONS } from '../data/catalog';
@@ -77,6 +78,13 @@ export class PlayerController {
   public isSprinting = false;
   public isReloading = false;
   public reloadTimer = 0;
+  public dodgeCooldown = 0;
+  private dodgeTimer = 0;
+  private dodgeDir = new THREE.Vector3();
+  private fovKick = 0;
+  private camRoll = 0;
+  private wetness = 0;
+  private onHeavyShot?: (strength: number) => void;
 
   public unlockedWeapons: WeaponId[] = ['axe', 'pistol'];
   public equippedWeapon: WeaponDef = WEAPONS.pistol;
@@ -185,6 +193,7 @@ export class PlayerController {
     });
 
     this.group.add(this.modelGroup);
+    applySilhouetteRim(this.modelGroup, 0xdbeafe, 0.45, 3.0);
     this.scene.add(this.group);
 
     const clips = this.assets.getClips(modelKey);
@@ -228,6 +237,44 @@ export class PlayerController {
 
   public setSurfaceResolver(fn: (x: number, z: number) => Surface): void {
     this.surfaceAt = fn;
+  }
+
+  public setOnHeavyShot(cb: (strength: number) => void): void {
+    this.onHeavyShot = cb;
+  }
+
+  public setWetness(w: number): void {
+    this.wetness = w;
+  }
+
+  public isDodging(): boolean {
+    return this.dodgeTimer > 0.02;
+  }
+
+  /** Tactical dash/evade on Space: consumes stamina, brief i-frames, dust burst & whoosh SFX. */
+  public tryDodge(): boolean {
+    if (this.dodgeTimer > 0 || this.dodgeCooldown > 0 || this.stamina < 24) return false;
+    const camFwd = this.camForward();
+    const camRight = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
+    const dir = new THREE.Vector3();
+    if (this.input.isDown('KeyW')) dir.add(camFwd);
+    if (this.input.isDown('KeyS')) dir.sub(camFwd);
+    if (this.input.isDown('KeyD')) dir.add(camRight);
+    if (this.input.isDown('KeyA')) dir.sub(camRight);
+    if (dir.lengthSq() < 0.01) dir.copy(this.getForward());
+    dir.normalize();
+
+    this.stamina = Math.max(0, this.stamina - 24);
+    this.isCrouching = false;
+    this.dodgeDir.copy(dir);
+    this.dodgeTimer = 0.24;
+    this.dodgeCooldown = 0.85;
+    this.fovKick = Math.max(this.fovKick, 4.5);
+    this.facing = Math.atan2(-dir.x, -dir.z);
+    this.playAnim('Jump', true, 0.26, 1.65);
+    this.audio.playDodge();
+    this.vfx.spawnDodgeBurst(this.getPosition(), dir);
+    return true;
   }
 
   public setCameraOccluders(list: THREE.Object3D[]): void {
@@ -411,6 +458,9 @@ export class PlayerController {
     this.noiseLevel = Math.max(0, this.noiseLevel - dt * 45);
     this.fireCooldown = Math.max(0, this.fireCooldown - dt);
     this.dryFireCooldown = Math.max(0, this.dryFireCooldown - dt);
+    this.dodgeCooldown = Math.max(0, this.dodgeCooldown - dt);
+    this.dodgeTimer = Math.max(0, this.dodgeTimer - dt);
+    this.fovKick = Math.max(0, this.fovKick - dt * 16);
     this.trauma = Math.max(0, this.trauma - dt * 1.8);
 
     if (this.isReloading) {
@@ -484,12 +534,22 @@ export class PlayerController {
       this.turnFacing(Math.atan2(-moveDir.x, -moveDir.z), dt, 12);
     }
 
-    // Velocity eases toward the target (snappy start, short stop)
-    const targetVx = isMoving ? moveDir.x * speed : 0;
-    const targetVz = isMoving ? moveDir.z * speed : 0;
-    const accel = Math.min(1, dt * (isMoving ? 14 : 18));
-    this.body.velocity.x += (targetVx - this.body.velocity.x) * accel;
-    this.body.velocity.z += (targetVz - this.body.velocity.z) * accel;
+    // Velocity eases toward the target (snappy start, short stop, or crisp dodge burst)
+    if (this.dodgeTimer > 0) {
+      this.body.velocity.x = this.dodgeDir.x * 10.6;
+      this.body.velocity.z = this.dodgeDir.z * 10.6;
+    } else {
+      const targetVx = isMoving ? moveDir.x * speed : 0;
+      const targetVz = isMoving ? moveDir.z * speed : 0;
+      const accel = Math.min(1, dt * (isMoving ? 14 : 18));
+      this.body.velocity.x += (targetVx - this.body.velocity.x) * accel;
+      this.body.velocity.z += (targetVz - this.body.velocity.z) * accel;
+    }
+
+    // Subtle camera strafe banking for tactile weight
+    const strafeDot = isMoving ? moveDir.dot(camRight) : 0;
+    const targetRoll = -strafeDot * (this.isSprinting ? 0.019 : 0.011);
+    this.camRoll += (targetRoll - this.camRoll) * Math.min(1, dt * 8);
 
     // Animate from how fast we *actually* move (not how fast we want to): pushing into a wall,
     // a car or a zombie no longer leaves the run cycle playing in slow motion on the spot.
@@ -523,7 +583,9 @@ export class PlayerController {
       const stride = this.locoMode === 'run' ? STRIDE.run : STRIDE.walk;
       if (this.stepDistance >= stride) {
         this.stepDistance -= stride;
-        this.audio.playFootstep(this.surfaceAt(smoothPos.x, smoothPos.z), this.isCrouching ? 0.1 : this.isSprinting ? 0.34 : 0.22);
+        const surf = this.surfaceAt(smoothPos.x, smoothPos.z);
+        this.audio.playFootstep(surf, this.isCrouching ? 0.1 : this.isSprinting ? 0.34 : 0.22);
+        this.vfx.spawnFootstepPuff(new THREE.Vector3(smoothPos.x, 0, smoothPos.z), surf, this.wetness, this.isSprinting);
       }
     } else {
       this.stepDistance = STRIDE.walk * 0.6; // first step lands soon after starting to move
@@ -626,6 +688,7 @@ export class PlayerController {
       this.facing = this.yaw;
       this.playAnim('Slash', true, 0.5, 1.5);
       this.audio.playUI('melee_swing', 0.55, 0.9 + Math.random() * 0.15);
+      this.vfx.spawnMeleeSlash(playerPos, this.getForward());
       this.pendingMelee = 0.16;
       return;
     }
@@ -633,7 +696,12 @@ export class PlayerController {
     const camDir = new THREE.Vector3();
     this.camera.getWorldDirection(camDir);
     const muzzlePos = this.getMuzzlePosition(camDir);
-    this.vfx.spawnMuzzleFlash(muzzlePos, camDir, w.id === 'shotgun' || w.id === 'sniper');
+    const isHeavy = w.id === 'shotgun' || w.id === 'sniper';
+    this.vfx.spawnMuzzleFlash(muzzlePos, camDir, isHeavy);
+    if (isHeavy) {
+      this.fovKick = Math.max(this.fovKick, w.id === 'sniper' ? 3.2 : 2.5);
+      this.onHeavyShot?.(w.id === 'sniper' ? 0.55 : 0.4);
+    }
     const rightDir = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0, 1, 0)).normalize();
     this.vfx.spawnShellCasing(muzzlePos, rightDir);
 
@@ -722,16 +790,22 @@ export class PlayerController {
     // only the boom length eases (in when blocked, out when clear).
     this.currentCamPos.copy(desired);
 
-    const shake = this.trauma * this.trauma * 0.12;
+    const shake = this.trauma * this.trauma * 0.13;
     const t = performance.now() * 0.001;
+    // Gentle breathing micro-sway while ADS aiming (sniper/rifle)
+    const swayAmt = this.isAiming ? (this.equippedWeapon.id === 'sniper' ? 0.006 : 0.0025) : 0;
+    const swayX = Math.sin(t * 1.4) * swayAmt;
+    const swayY = Math.cos(t * 2.1) * swayAmt;
     this.camera.position
       .copy(this.currentCamPos)
       .add(new THREE.Vector3(Math.sin(t * 47) * shake, Math.sin(t * 53 + 1.3) * shake, Math.sin(t * 41 + 2.1) * shake));
-    this.camera.lookAt(this.camera.position.clone().add(lookDir));
+    this.camera.lookAt(this.camera.position.clone().add(lookDir).add(new THREE.Vector3(swayX, swayY, 0)));
+    this.camera.rotation.z += this.camRoll;
 
-    const targetFov = this.isAiming ? (this.equippedWeapon.id === 'sniper' ? 32 : 50) : this.isSprinting ? 70 : 65;
+    const baseFov = this.isAiming ? (this.equippedWeapon.id === 'sniper' ? 32 : 50) : this.isSprinting ? 70 : 65;
+    const targetFov = baseFov + this.fovKick;
     if (Math.abs(this.camera.fov - targetFov) > 0.05) {
-      this.camera.fov = THREE.MathUtils.lerp(this.camera.fov, targetFov, Math.min(1, dt * 10));
+      this.camera.fov = THREE.MathUtils.lerp(this.camera.fov, targetFov, Math.min(1, dt * 11));
       this.camera.updateProjectionMatrix();
     }
   }
