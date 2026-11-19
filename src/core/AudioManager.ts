@@ -53,6 +53,7 @@ export class AudioManager {
   private ctx: AudioContext;
 
   private sfxBus: GainNode;
+  private voiceBus: GainNode;
   private musicBus: GainNode;
   private ambienceBus: GainNode;
   private musicDuck: GainNode;
@@ -61,6 +62,7 @@ export class AudioManager {
   private reverbBus: GainNode;
   private muffle: BiquadFilterNode;
   private compressor: DynamicsCompressorNode;
+  private activeVoice: { src: AudioBufferSourceNode; gain: GainNode } | null = null;
 
   // Procedural adaptive soundtrack state
   private droneOsc1: OscillatorNode | null = null;
@@ -136,6 +138,9 @@ export class AudioManager {
     this.sfxBus = this.ctx.createGain();
     this.sfxBus.connect(this.listener.getInput());
 
+    this.voiceBus = this.ctx.createGain();
+    this.voiceBus.connect(this.listener.getInput());
+
     this.musicDuck = this.ctx.createGain();
     this.musicDuck.gain.value = 1;
     this.musicDuck.connect(this.listener.getInput());
@@ -200,6 +205,7 @@ export class AudioManager {
     if (this.disposed) return;
     const now = this.ctx.currentTime;
     this.sfxBus.gain.setTargetAtTime(0.85 * this.busVolumes.sfx, now, 0.04);
+    this.voiceBus.gain.setTargetAtTime(1.12 * this.busVolumes.sfx, now, 0.04);
     this.musicBus.gain.setTargetAtTime(0.55 * this.busVolumes.music, now, 0.04);
     this.ambienceBus.gain.setTargetAtTime(0.95 * this.busVolumes.ambience, now, 0.04);
   }
@@ -546,7 +552,7 @@ export class AudioManager {
     }, (distance / 343) * 1000);
   }
 
-  // ───────────────────────────── Captain Reyes Speech Synthesis Radio Comms ─────────────────────────────
+  // ───────────────────────────── Captain Reyes Kokoro-82M Radio Comms ─────────────────────────────
 
   public setVoiceEnabled(enabled: boolean): void {
     this.voiceEnabled = enabled;
@@ -558,6 +564,18 @@ export class AudioManager {
   }
 
   public stopSpeech(): void {
+    if (this.activeVoice) {
+      const { src, gain } = this.activeVoice;
+      this.activeVoice = null;
+      src.onended = null;
+      try {
+        src.stop();
+      } catch {
+        /* already stopped */
+      }
+      src.disconnect();
+      gain.disconnect();
+    }
     try {
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
@@ -567,7 +585,48 @@ export class AudioManager {
     }
   }
 
-  /** Speaks Captain Reyes's radio line via native Web Speech API with automatic soundtrack ducking & roger beep. */
+  /** Plays a studio-mastered Kokoro-82M Captain Reyes radio transmission with automatic ducking & roger beep. */
+  public playRadioVoice(voiceKey?: string, fallbackText?: string): void {
+    if (this.muted || !this.voiceEnabled || this.disposed) return;
+    this.stopSpeech();
+
+    const buf = voiceKey ? this.assets.getAudioBuffer(voiceKey) : undefined;
+    if (!buf) {
+      if (fallbackText) this.speakRadio(fallbackText);
+      return;
+    }
+
+    this.resume();
+    const t = this.ctx.currentTime + 0.09; // let radio squelch open cleanly before Reyes speaks
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = 1.0;
+
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.linearRampToValueAtTime(1.0, t + 0.025);
+    src.connect(gain).connect(this.voiceBus);
+
+    this.duck(0.64, buf.duration + 0.45);
+    const entry = { src, gain };
+    this.activeVoice = entry;
+
+    src.onended = () => {
+      if (this.activeVoice === entry) {
+        this.activeVoice = null;
+        if (!this.disposed && !this.muted && this.voiceEnabled) {
+          // Crisp military radio roger-beep closing the transmission
+          this.envTone('sine', 1340, 1340, 0.052, 0.048);
+          this.envTone('sine', 960, 960, 0.062, 0.042, 0.062);
+        }
+      }
+      src.disconnect();
+      gain.disconnect();
+    };
+    src.start(t);
+  }
+
+  /** Web Speech API fallback if a Kokoro audio buffer is unavailable. */
   public speakRadio(text: string): void {
     if (this.muted || !this.voiceEnabled || this.disposed) return;
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
@@ -862,6 +921,14 @@ export class AudioManager {
     if (this.muted || this.disposed) return;
     this.playPositional('explosion_low', position, 0.85, 0.08, 12, 0.5, 0.75);
     this.envTone('sine', 95, 32, 0.26, 0.24);
+  }
+
+  /** Visceral wet bone-snap + flesh-tear positional audio when blowing off zombie limbs or heads. */
+  public playDismember(position: THREE.Vector3, heavy = false): void {
+    if (this.muted || this.disposed) return;
+    this.playPositional('impact_flesh', position, heavy ? 0.92 : 0.78, 0.1, 8, 0.18, heavy ? 0.72 : 0.84);
+    this.playPositional('wood_break', position, heavy ? 0.52 : 0.4, 0.14, 7, 0.12, heavy ? 1.32 : 1.55);
+    this.envTone('sine', heavy ? 115 : 145, 38, heavy ? 0.18 : 0.12, heavy ? 0.18 : 0.11);
   }
 
   // ───────────────────────────── Synthesised Tactile Cues ─────────────────────────────

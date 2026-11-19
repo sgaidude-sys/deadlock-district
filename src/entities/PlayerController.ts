@@ -728,7 +728,21 @@ export class PlayerController {
       this.raycaster.far = w.range;
 
       let endPoint = origin.clone().addScaledVector(dir, w.range);
-      const validHit = this.raycaster.intersectObjects(raycastTargets, true)[0];
+      let validHit = this.raycaster.intersectObjects(raycastTargets, true)[0];
+
+      // Close-quarters parallax assist: if the over-the-shoulder camera ray passed beside a zombie
+      // hugging right in front of the player's barrel (< 4.5m), check straight out from the player chest/muzzle.
+      if (!validHit || !validHit.object.userData.zombieId) {
+        const cqbOrigin = playerPos.clone().setY(this.isCrouching ? 0.78 : 1.02);
+        this.raycaster.set(cqbOrigin, dir);
+        this.raycaster.far = 4.5;
+        const cqbHits = this.raycaster.intersectObjects(raycastTargets, true);
+        const cqbZombie = cqbHits.find((h) => h.object.userData.zombieId);
+        if (cqbZombie && (!validHit || cqbZombie.distance < validHit.distance + 1.2)) {
+          validHit = cqbZombie;
+        }
+      }
+
       if (validHit) {
         endPoint = validHit.point;
         const normal = validHit.face?.normal

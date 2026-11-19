@@ -134,6 +134,7 @@ export class Game {
   private resting: { lastPhase: string } | null = null;
   private ending: { t: number; truckSpeed: number; boarded: boolean } | null = null;
   private lastPos = new THREE.Vector3();
+  private exitBloodRay = new THREE.Raycaster();
 
   private sunLight: THREE.DirectionalLight;
   private hemiLight: THREE.HemisphereLight;
@@ -543,10 +544,45 @@ export class Game {
         if (barrel) this.detonate(barrel);
         return;
       }
-      const res = this.zombieManager?.damageZombieByObject(obj, damage, point, normal, impulseDir);
+      const res = this.zombieManager?.damageZombieByObject(obj, damage, point, normal, impulseDir, {
+        heavy: weapon.id === 'shotgun' || weapon.id === 'sniper',
+      });
       if (res) {
         this.registerHit(res.killed ? 'kill' : res.headshot ? 'head' : 'hit');
-        if (weapon.id === 'shotgun' || weapon.id === 'sniper' || res.killed) this.hitStopTimer = 0.03;
+        if (weapon.id === 'shotgun' || weapon.id === 'sniper' || res.killed || res.dismembered) {
+          this.hitStopTimer = res.dismembered ? 0.036 : 0.03;
+        }
+        if (res.dismembered) {
+          this.player?.addTrauma(0.12);
+          this.impactPulse = Math.max(this.impactPulse, 0.25);
+        }
+
+        // Exit-wound blood splatter cast behind the shot zombie onto walls, vehicles, containers, or concrete
+        const exitDir = impulseDir.lengthSq() > 0.0001 ? impulseDir.clone().normalize() : new THREE.Vector3(0, 0, 1);
+        this.exitBloodRay.set(point.clone().addScaledVector(exitDir, 0.22), exitDir);
+        this.exitBloodRay.far = 4.8;
+        const wallHits = this.exitBloodRay.intersectObjects(this.worldData.raycastTargets, true);
+        if (wallHits.length > 0) {
+          const wh = wallHits[0];
+          const wNorm = wh.face
+            ? wh.face.normal.clone().transformDirection(wh.object.matrixWorld).normalize()
+            : exitDir.clone().negate();
+          const splatSize = res.headshot || res.dismembered ? 1.15 : weapon.id === 'shotgun' ? 1.05 : 0.78;
+          this.vfx.spawnBloodSplat(wh.point, wNorm, splatSize);
+        }
+        // Directional ground blood splatter behind the zombie
+        if (res.headshot || res.dismembered || res.killed || Math.random() < 0.6) {
+          const drop = point.clone().addScaledVector(exitDir, 0.65 + Math.random() * 0.95);
+          drop.y = 0.078;
+          this.vfx.spawnBloodSplat(drop, new THREE.Vector3(0, 1, 0), res.dismembered || res.headshot ? 1.05 : 0.68);
+        }
+
+        // Occasional Kokoro-82M tactical combat callouts from Captain Reyes
+        if (res.killed && res.headshot) {
+          this.story?.playCallout('voice_reyes_callout_headshot', 'Clean headshot. Keep dropping them!', 2.41, 24);
+        } else if (res.dismembered === 'arm_l' || res.dismembered === 'arm_r') {
+          this.story?.playCallout('voice_reyes_callout_limb', 'Blew its arm clean off. Stay sharp!', 2.54, 24);
+        }
         return;
       }
       const vehicleId = Game.findTag(obj, 'vehicleId');
@@ -596,8 +632,21 @@ export class Game {
     this.vfx.spawnImpactSparks(hidden, up);
     this.vfx.spawnBloodDecal(hidden);
     this.vfx.spawnExplosion(hidden, 0.2);
-    // Every zombie rig, including ones not in the starting population (brutes appear later)
-    const standIns = ['zombie_basic', 'zombie_arm', 'zombie_ribcage', 'zombie_chubby'].map((k) => {
+    // Every zombie rig & Blender gore gib, including ones not in the starting population
+    const standIns = [
+      'zombie_basic',
+      'zombie_arm',
+      'zombie_ribcage',
+      'zombie_chubby',
+      'gib_head',
+      'gib_brute_head',
+      'gib_arm_l',
+      'gib_arm_r',
+      'gib_leg_l',
+      'gib_leg_r',
+      'gib_chunk',
+      'gib_stump',
+    ].map((k) => {
       const m = this.assets.cloneModel(k);
       m.position.copy(hidden);
       this.scene.add(m);
@@ -834,6 +883,7 @@ export class Game {
       item.consumed = true;
       this.dog?.recruit();
       this.showToast('Survivor dog recruited! It barks at threats and pins zombies.');
+      this.story?.playCallout('voice_reyes_callout_dog', "Good boy. Keep that shepherd close, he'll watch your six.", 3.46, 60);
     } else if (item.type === 'extraction_truck') {
       if (this.story?.stage === 'board') {
         this.startEnding();
@@ -1027,7 +1077,7 @@ export class Game {
     });
     story.setOnRadioLine((line) => {
       this.audio.playRadioStatic();
-      this.audio.speakRadio(line.text);
+      this.audio.playRadioVoice(line.voiceId, line.text);
     });
     return story;
   }
@@ -1399,6 +1449,9 @@ export class Game {
         this.damageFlashTimer = 0.25;
         this.impactPulse = Math.max(this.impactPulse, 0.45);
         this.damageEvents.push({ from: from.clone(), t: 1.2 });
+        if (this.player.health > 0 && this.player.health <= this.player.maxHealth * 0.3) {
+          this.story?.playCallout('voice_reyes_callout_lowhp', "You're bleeding out. Patch yourself up!", 2.28, 35);
+        }
       }
     );
 

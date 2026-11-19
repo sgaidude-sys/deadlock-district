@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { AssetManager } from './AssetManager';
 import type { Surface } from './AudioManager';
+import { bloodSplatTextures } from '../world/ProceduralTextures';
 
 interface PooledParticle {
   sprite: THREE.Sprite;
@@ -51,6 +52,28 @@ interface ShellCasing {
   landed: boolean;
 }
 
+interface ActiveGib {
+  mesh: THREE.Group;
+  velocity: THREE.Vector3;
+  angVel: THREE.Vector3;
+  age: number;
+  lifetime: number;
+  bounces: number;
+  restHeight: number;
+  scale: number;
+  trailTimer: number;
+  mats: THREE.MeshStandardMaterial[];
+}
+
+export type GibModelKey =
+  | 'gib_head'
+  | 'gib_brute_head'
+  | 'gib_arm_l'
+  | 'gib_arm_r'
+  | 'gib_leg_l'
+  | 'gib_leg_r'
+  | 'gib_chunk';
+
 interface FireEmitter {
   position: THREE.Vector3;
   timer: number;
@@ -96,9 +119,11 @@ export class VFXManager {
   private ringCursor = 0;
 
   private casings: ShellCasing[] = [];
+  private gibs: ActiveGib[] = [];
   private fireEmitters: FireEmitter[] = [];
   private fogWisps: FogWisp[] = [];
   private decals: THREE.Object3D[] = [];
+  private bloodSplats: THREE.Mesh[] = [];
   private bulletHoles: THREE.Mesh[] = [];
   private markers: { group: THREE.Group; beam: THREE.Mesh; glow: THREE.Sprite; phase: number }[] = [];
 
@@ -109,6 +134,8 @@ export class VFXManager {
   private blastLightLevel = 0;
   private scorches: THREE.Mesh[] = [];
   private scorchGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
+  private splatGeo = new THREE.PlaneGeometry(1, 1);
+  private splatMats: THREE.MeshStandardMaterial[] = [];
   private holeGeo = new THREE.PlaneGeometry(0.14, 0.14);
   private holeMatDark: THREE.MeshBasicMaterial;
   private holeMatMetal: THREE.MeshBasicMaterial;
@@ -151,6 +178,23 @@ export class VFXManager {
     this.assets = assets;
 
     this.softTex = VFXManager.makeSoftCircleTexture();
+
+    this.splatMats = bloodSplatTextures().map(
+      (tex) =>
+        new THREE.MeshStandardMaterial({
+          map: tex,
+          color: 0xffffff,
+          roughness: 0.14,
+          metalness: 0.05,
+          transparent: true,
+          opacity: 0.94,
+          depthWrite: false,
+          polygonOffset: true,
+          polygonOffsetFactor: -4,
+          polygonOffsetUnits: -4,
+          side: THREE.DoubleSide,
+        })
+    );
 
     this.holeMatDark = new THREE.MeshBasicMaterial({
       map: this.softTex,
@@ -782,31 +826,164 @@ export class VFXManager {
     });
   }
 
-  public spawnBloodBurst(pos: THREE.Vector3, normalDir: THREE.Vector3, count = 10): void {
+  public spawnBloodBurst(pos: THREE.Vector3, normalDir: THREE.Vector3, count = 12): void {
     const tex = this.tex('vfx_dirt_01', 'vfx_dirt_03');
-    const n = this.highQuality ? count : Math.max(4, Math.round(count * 0.6));
+    const n = this.highQuality ? count : Math.max(5, Math.round(count * 0.65));
     for (let i = 0; i < n; i++) {
-      const scale = 0.14 + Math.random() * 0.22;
+      const scale = 0.14 + Math.random() * 0.24;
       const vel = normalDir
         .clone()
-        .multiplyScalar(1.6 + Math.random() * 3.1)
-        .add(new THREE.Vector3((Math.random() - 0.5) * 2.6, 0.8 + Math.random() * 2.2, (Math.random() - 0.5) * 2.6));
+        .multiplyScalar(1.8 + Math.random() * 3.8)
+        .add(new THREE.Vector3((Math.random() - 0.5) * 2.8, 0.9 + Math.random() * 2.4, (Math.random() - 0.5) * 2.8));
       this.emit(
         i % 2 === 0 ? tex : this.softTex,
-        i % 3 === 0 ? 0x5b0a0a : 0x9b1111,
+        i % 3 === 0 ? 0x4c0508 : i % 3 === 1 ? 0x8f0d12 : 0xb91c1c,
         pos,
         vel,
         scale,
-        scale * 1.6,
-        0.35 + Math.random() * 0.3,
-        0.95,
+        scale * 1.55,
+        0.38 + Math.random() * 0.34,
+        0.96,
         false,
-        12,
-        0.6
+        13.5,
+        0.55
       );
     }
     // Crimson aerosol mist
-    this.spawnPuff(pos.clone(), normalDir.clone().multiplyScalar(0.6), 0x7f1d1d, 0.25, 0.95, 0.45, 0.48);
+    this.spawnPuff(pos.clone(), normalDir.clone().multiplyScalar(0.75), 0x7f1d1d, 0.28, 1.08, 0.5, 0.52);
+  }
+
+  /** Pressurized directional arterial spray fountain triggered on decapitations, limb snaps, and heavy headshots. */
+  public spawnArterialSpray(pos: THREE.Vector3, dir: THREE.Vector3, count = 18, speed = 4.8): void {
+    const tex = this.tex('vfx_dirt_01', 'vfx_dirt_03');
+    const n = this.highQuality ? count : Math.max(8, Math.round(count * 0.6));
+    const baseDir = dir.lengthSq() > 0.0001 ? dir.clone().normalize() : new THREE.Vector3(0, 1, 0);
+    for (let i = 0; i < n; i++) {
+      const jet = (0.45 + Math.random() * 0.85) * speed;
+      const vel = baseDir
+        .clone()
+        .multiplyScalar(jet)
+        .add(new THREE.Vector3((Math.random() - 0.5) * 2.1, 1.2 + Math.random() * 2.6, (Math.random() - 0.5) * 2.1));
+      const scale = 0.09 + Math.random() * 0.18;
+      this.emit(
+        i % 3 === 0 ? tex : this.softTex,
+        i % 2 === 0 ? 0xa30e14 : 0x5c0609,
+        pos,
+        vel,
+        scale,
+        scale * 1.45,
+        0.42 + Math.random() * 0.38,
+        0.98,
+        false,
+        15.2,
+        0.35
+      );
+    }
+    this.spawnPuff(pos.clone(), baseDir.clone().multiplyScalar(1.1), 0x881317, 0.32, 1.25, 0.54, 0.55);
+  }
+
+  /** Compact continuous blood spurt from a live dismembered zombie stump. */
+  public spawnBleedDrip(pos: THREE.Vector3, dir: THREE.Vector3): void {
+    const baseDir = dir.lengthSq() > 0.0001 ? dir.clone().normalize() : new THREE.Vector3(0, 1, 0);
+    for (let i = 0; i < 2; i++) {
+      const vel = baseDir
+        .clone()
+        .multiplyScalar(1.2 + Math.random() * 1.6)
+        .add(new THREE.Vector3((Math.random() - 0.5) * 0.9, 0.8 + Math.random() * 1.3, (Math.random() - 0.5) * 0.9));
+      this.emit(this.softTex, i === 0 ? 0x990f15 : 0x520508, pos, vel, 0.085, 0.14, 0.34 + Math.random() * 0.2, 0.92, false, 14.5, 0.3);
+    }
+  }
+
+  /** Glossy wet blood splat decal flush against walls, vehicles, containers, or pavement (capped). */
+  public spawnBloodSplat(pos: THREE.Vector3, normal: THREE.Vector3, size = 0.85): void {
+    if (pos.y < -5 || this.splatMats.length === 0) return;
+    const n = normal.lengthSq() > 0.0001 ? normal.clone().normalize() : new THREE.Vector3(0, 1, 0);
+    const mat = this.splatMats[Math.floor(Math.random() * this.splatMats.length)];
+    const mesh = new THREE.Mesh(this.splatGeo, mat);
+    if (n.y > 0.92) {
+      mesh.position.set(pos.x, Math.max(0.078, pos.y + 0.015), pos.z);
+    } else {
+      mesh.position.copy(pos).addScaledVector(n, 0.022);
+    }
+    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+    mesh.rotateZ(Math.random() * Math.PI * 2);
+    const sx = size * (0.86 + Math.random() * 0.38);
+    const sy = size * (0.86 + Math.random() * 0.38);
+    mesh.scale.set(sx, sy, 1);
+    mesh.receiveShadow = true;
+    mesh.renderOrder = 2;
+    this.scene.add(mesh);
+    this.bloodSplats.push(mesh);
+    if (this.bloodSplats.length > 72) {
+      this.scene.remove(this.bloodSplats.shift()!);
+    }
+  }
+
+  /** Launches a physical tumbling & bouncing Blender-sliced severed zombie body part (.glb). */
+  public spawnGib(
+    modelKey: GibModelKey,
+    pos: THREE.Vector3,
+    impulseDir: THREE.Vector3,
+    scale = 1.0,
+    power = 1.0
+  ): void {
+    if (!this.assets.hasModel(modelKey)) return;
+    const mesh = this.assets.cloneModel(modelKey);
+    mesh.position.copy(pos);
+    mesh.scale.setScalar(scale);
+    mesh.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+
+    const mats: THREE.MeshStandardMaterial[] = [];
+    mesh.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh) {
+        const m = o as THREE.Mesh;
+        m.castShadow = true;
+        m.receiveShadow = true;
+        const cloned = Array.isArray(m.material) ? m.material.map((mm) => mm.clone()) : m.material.clone();
+        m.material = cloned;
+        for (const mat of Array.isArray(cloned) ? cloned : [cloned]) {
+          if (mat instanceof THREE.MeshStandardMaterial) mats.push(mat);
+        }
+      }
+    });
+
+    const dir = impulseDir.lengthSq() > 0.0001 ? impulseDir.clone().normalize() : new THREE.Vector3(0, 0, 1);
+    const speed = (3.0 + Math.random() * 3.4) * power;
+    const velocity = new THREE.Vector3(
+      dir.x * speed + (Math.random() - 0.5) * 2.4,
+      (2.4 + Math.random() * 2.6) * power,
+      dir.z * speed + (Math.random() - 0.5) * 2.4
+    );
+    const angVel = new THREE.Vector3(
+      (Math.random() - 0.5) * 16,
+      (Math.random() - 0.5) * 16,
+      (Math.random() - 0.5) * 16
+    );
+    const restHeight = modelKey.includes('head')
+      ? 0.22 * scale
+      : modelKey.includes('arm') || modelKey.includes('leg')
+      ? 0.15 * scale
+      : 0.11 * scale;
+
+    this.scene.add(mesh);
+    this.gibs.push({
+      mesh,
+      velocity,
+      angVel,
+      age: 0,
+      lifetime: 11.5 + Math.random() * 2.5,
+      bounces: 0,
+      restHeight,
+      scale,
+      trailTimer: 0.02,
+      mats,
+    });
+
+    if (this.gibs.length > 28) {
+      const old = this.gibs.shift()!;
+      this.scene.remove(old.mesh);
+      for (const mat of old.mats) mat.dispose();
+    }
   }
 
   public spawnImpactSparks(pos: THREE.Vector3, normal: THREE.Vector3, isMetal = false): void {
@@ -839,12 +1016,13 @@ export class VFXManager {
     }
   }
 
-  /** Persistent blood pool on the ground (capped). */
+  /** Persistent blood pool on the ground (layered glossy splat + 3D kit puddle, capped). */
   public spawnBloodDecal(pos: THREE.Vector3): void {
+    this.spawnBloodSplat(new THREE.Vector3(pos.x, 0.078, pos.z), new THREE.Vector3(0, 1, 0), 1.15 + Math.random() * 0.5);
     const keys = ['prop_blood1', 'prop_blood2', 'prop_blood3'].filter((k) => this.assets.hasModel(k));
     if (keys.length === 0) return;
     const decal = this.assets.cloneModel(keys[Math.floor(Math.random() * keys.length)]);
-    decal.position.set(pos.x, 0.07, pos.z);
+    decal.position.set(pos.x, 0.072, pos.z);
     decal.rotation.y = Math.random() * Math.PI * 2;
     decal.scale.setScalar(0.45 + Math.random() * 0.35);
     decal.traverse((o) => {
@@ -1217,6 +1395,98 @@ export class VFXManager {
         c.velocity.x *= 0.65;
         c.velocity.z *= 0.65;
         c.angVel.multiplyScalar(0.5);
+      }
+    }
+
+    // Update tumbling severed zombie body parts & gore chunks
+    const upNorm = this.tmpVec3.set(0, 1, 0);
+    for (let i = this.gibs.length - 1; i >= 0; i--) {
+      const g = this.gibs[i];
+      g.age += dt;
+      if (g.age >= g.lifetime) {
+        this.scene.remove(g.mesh);
+        for (const mat of g.mats) mat.dispose();
+        this.gibs.splice(i, 1);
+        continue;
+      }
+
+      if (g.mesh.position.y > g.restHeight + 0.005 || Math.abs(g.velocity.y) > 0.1 || g.velocity.lengthSq() > 0.01) {
+        g.velocity.y -= 17.5 * dt;
+        g.mesh.position.addScaledVector(g.velocity, dt);
+        g.mesh.rotation.x += g.angVel.x * dt;
+        g.mesh.rotation.y += g.angVel.y * dt;
+        g.mesh.rotation.z += g.angVel.z * dt;
+
+        // Blood trail droplets while airborne
+        if (g.bounces < 2 && g.age < 1.35) {
+          g.trailTimer -= dt;
+          if (g.trailTimer <= 0) {
+            g.trailTimer = 0.045;
+            this.emit(
+              this.softTex,
+              0x8b0a0e,
+              g.mesh.position,
+              new THREE.Vector3((Math.random() - 0.5) * 0.7, 0.25, (Math.random() - 0.5) * 0.7),
+              0.08,
+              0.14,
+              0.3,
+              0.88,
+              false,
+              13
+            );
+          }
+        }
+
+        if (g.mesh.position.y <= g.restHeight) {
+          g.mesh.position.y = g.restHeight;
+          const impactSpeed = Math.abs(g.velocity.y);
+          if (impactSpeed > 0.9) {
+            g.velocity.y = impactSpeed * 0.35;
+            g.velocity.x *= 0.62;
+            g.velocity.z *= 0.62;
+            g.angVel.multiplyScalar(0.55);
+            if (g.bounces < 2) {
+              this.spawnBloodSplat(
+                new THREE.Vector3(g.mesh.position.x, 0.078, g.mesh.position.z),
+                upNorm,
+                (0.5 + Math.random() * 0.38) * g.scale
+              );
+              for (let k = 0; k < 4; k++) {
+                this.emit(
+                  this.softTex,
+                  0x940c12,
+                  g.mesh.position,
+                  new THREE.Vector3((Math.random() - 0.5) * 2.2, 0.9 + Math.random() * 1.1, (Math.random() - 0.5) * 2.2),
+                  0.075,
+                  0.13,
+                  0.28,
+                  0.9,
+                  false,
+                  13
+                );
+              }
+            }
+            g.bounces++;
+          } else {
+            g.velocity.y = 0;
+            g.velocity.x *= Math.max(0, 1 - dt * 8);
+            g.velocity.z *= Math.max(0, 1 - dt * 8);
+            g.angVel.multiplyScalar(Math.max(0, 1 - dt * 9));
+          }
+        }
+      }
+
+      // Smooth fade-out during final 1.5s
+      const remain = g.lifetime - g.age;
+      if (remain < 1.5) {
+        const a = Math.max(0, remain / 1.5);
+        for (const mat of g.mats) {
+          if (!mat.transparent) {
+            mat.transparent = true;
+            mat.needsUpdate = true;
+          }
+          mat.opacity = a;
+        }
       }
     }
   }

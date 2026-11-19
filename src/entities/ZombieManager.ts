@@ -46,19 +46,57 @@ export interface ZombieInstance {
   avoidDir: THREE.Vector3;
   lastPos: THREE.Vector3;
   meshes: THREE.Mesh[];
+  modelKey: string;
+  bones: {
+    head?: THREE.Object3D;
+    neck?: THREE.Object3D;
+    upperArmL?: THREE.Object3D;
+    lowerArmL?: THREE.Object3D;
+    upperArmR?: THREE.Object3D;
+    lowerArmR?: THREE.Object3D;
+    upperLegL?: THREE.Object3D;
+    lowerLegL?: THREE.Object3D;
+    upperLegR?: THREE.Object3D;
+    lowerLegR?: THREE.Object3D;
+  };
+  hitboxes: Partial<Record<HitZone, THREE.Mesh>>;
+  dismembered: {
+    head: boolean;
+    armL: boolean;
+    armR: boolean;
+    legL: boolean;
+    legR: boolean;
+  };
+  bleedSockets: { bone: THREE.Object3D; localOffset: THREE.Vector3; timer: number; acc: number }[];
   deathTimer: number;
   deathFall: number;
   facing: number;
 }
 
+export type HitZone = 'head' | 'torso' | 'arm_l' | 'arm_r' | 'leg_l' | 'leg_r';
+export type DismemberPart = 'head' | 'arm_l' | 'arm_r' | 'leg_l' | 'leg_r' | 'gib';
+
 export interface ZombieHitResult {
   killed: boolean;
   headshot: boolean;
+  dismembered?: DismemberPart;
+}
+
+export interface DamageOptions {
+  heavy?: boolean;
+  melee?: boolean;
+  explosion?: boolean;
+  hitZone?: HitZone;
 }
 
 const UP = new THREE.Vector3(0, 1, 0);
-/** Raycast-only material: the mesh stays "visible" to the raycaster but never draws. */
+/** Raycast-only material & shared locational hitbox geometries for accurate limb/head dismemberment. */
 const HITBOX_MAT = new THREE.MeshBasicMaterial({ visible: false });
+const HB_HEAD_GEO = new THREE.SphereGeometry(0.42, 8, 8);
+const HB_TORSO_GEO = new THREE.CylinderGeometry(0.36, 0.34, 0.58, 8);
+const HB_ARM_GEO = new THREE.BoxGeometry(0.38, 0.54, 0.62);
+const HB_LEG_GEO = new THREE.CylinderGeometry(0.2, 0.18, 0.48, 6);
+const HB_CRAWLER_GEO = new THREE.BoxGeometry(0.76, 0.56, 1.25);
 
 type AnimRole = 'idle' | 'walk' | 'run' | 'attack' | 'hit' | 'death';
 
@@ -237,8 +275,19 @@ export class ZombieManager {
     this.scene.add(group);
 
     const meshes: THREE.Mesh[] = [];
+    const bones: ZombieInstance['bones'] = {};
     group.traverse((o) => {
       o.userData.zombieId = id;
+      if (o.name === 'Head') bones.head = o;
+      else if (o.name === 'Neck') bones.neck = o;
+      else if (o.name === 'UpperArm.L') bones.upperArmL = o;
+      else if (o.name === 'LowerArm.L') bones.lowerArmL = o;
+      else if (o.name === 'UpperArm.R') bones.upperArmR = o;
+      else if (o.name === 'LowerArm.R') bones.lowerArmR = o;
+      else if (o.name === 'UpperLeg.L') bones.upperLegL = o;
+      else if (o.name === 'LowerLeg.L') bones.lowerLegL = o;
+      else if (o.name === 'UpperLeg.R') bones.upperLegR = o;
+      else if (o.name === 'LowerLeg.R') bones.lowerLegR = o;
       if ((o as THREE.Mesh).isMesh) {
         const m = o as THREE.Mesh;
         // Own material per zombie so the hit flash only affects this one
@@ -259,17 +308,32 @@ export class ZombieManager {
     const rimStr = opts.boss ? 0.85 : archetype === 'brute' ? 0.62 : archetype === 'sprinter' ? 0.5 : 0.36;
     applySilhouetteRim(group, rimHex, rimStr, 3.1);
 
-    // Invisible hitbox: SkinnedMesh raycasts use a stale bind-pose bounding sphere (missed shots)
-    // and are expensive. A simple shape in the zombie's local space is reliable and cheap.
-    const hbH = spec.height; // local units; the group's scale applies on top
-    const hitbox =
-      archetype === 'crawler'
-        ? new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.5, 1.1), HITBOX_MAT)
-        : new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.26, hbH, 8), HITBOX_MAT);
-    hitbox.position.set(0, archetype === 'crawler' ? 0.25 : hbH / 2, archetype === 'crawler' ? 0.15 : 0);
-    hitbox.userData.zombieId = id;
-    group.add(hitbox);
-    group.userData.hitbox = hitbox;
+    // Multi-part locational hitboxes strictly on the zombie so shooting head, arms, torso, or legs
+    // registers crisply and detaches the exact zombie body part hit.
+    const hbH = spec.height;
+    const hitboxes: Partial<Record<HitZone, THREE.Mesh>> = {};
+    const addZone = (zone: HitZone, geo: THREE.BufferGeometry, x: number, y: number, zOff: number, s = 1) => {
+      const m = new THREE.Mesh(geo, HITBOX_MAT);
+      m.position.set(x, y, zOff);
+      if (s !== 1) m.scale.setScalar(s);
+      m.userData.zombieId = id;
+      m.userData.hitZone = zone;
+      group.add(m);
+      hitboxes[zone] = m;
+    };
+
+    if (archetype === 'crawler') {
+      addZone('torso', HB_CRAWLER_GEO, 0, 0.28, 0.15);
+      addZone('head', HB_HEAD_GEO, 0, 0.42, 0.62, 0.85);
+    } else {
+      const wScale = archetype === 'brute' ? 1.2 : 1.0;
+      addZone('head', HB_HEAD_GEO, 0, hbH * 0.92, 0.05, wScale);
+      addZone('torso', HB_TORSO_GEO, 0, hbH * 0.56, 0, wScale);
+      addZone('arm_l', HB_ARM_GEO, 0.42 * wScale, hbH * 0.6, 0.18, wScale);
+      addZone('arm_r', HB_ARM_GEO, -0.42 * wScale, hbH * 0.6, 0.18, wScale);
+      addZone('leg_l', HB_LEG_GEO, 0.19 * wScale, hbH * 0.22, 0, wScale);
+      addZone('leg_r', HB_LEG_GEO, -0.19 * wScale, hbH * 0.22, 0, wScale);
+    }
 
     const body = new CANNON.Body({
       mass: archetype === 'brute' ? 130 : 65,
@@ -331,6 +395,11 @@ export class ZombieManager {
       avoidDir: new THREE.Vector3(),
       lastPos: group.position.clone(),
       meshes,
+      modelKey,
+      bones,
+      hitboxes,
+      dismembered: { head: false, armL: false, armR: false, legL: false, legR: false },
+      bleedSockets: [],
       deathTimer: 0,
       deathFall: 0,
       facing: Math.random() * Math.PI * 2,
@@ -396,18 +465,219 @@ export class ZombieManager {
     }
   }
 
+  /** Re-enforces collapsed bone scales after AnimationMixer updates so severed zombie limbs never pop back. */
+  private enforceSeveredBones(z: ZombieInstance): void {
+    if (z.dismembered.head && z.bones.head) z.bones.head.scale.setScalar(0.001);
+    if (z.dismembered.armL) {
+      const b = z.bones.upperArmL ?? z.bones.lowerArmL;
+      if (b) b.scale.setScalar(0.001);
+    }
+    if (z.dismembered.armR) {
+      const b = z.bones.upperArmR ?? z.bones.lowerArmR;
+      if (b) b.scale.setScalar(0.001);
+    }
+    if (z.dismembered.legL) {
+      const b = z.bones.upperLegL ?? z.bones.lowerLegL;
+      if (b) b.scale.setScalar(0.001);
+    }
+    if (z.dismembered.legR) {
+      const b = z.bones.upperLegR ?? z.bones.lowerLegR;
+      if (b) b.scale.setScalar(0.001);
+    }
+  }
+
+  /** Emits arterial spurts from live & freshly killed severed zombie bone sockets. */
+  private updateBleedSockets(z: ZombieInstance, dt: number): void {
+    if (z.bleedSockets.length === 0) return;
+    const worldPos = new THREE.Vector3();
+    const sprayDir = new THREE.Vector3();
+    for (let i = z.bleedSockets.length - 1; i >= 0; i--) {
+      const s = z.bleedSockets[i];
+      s.timer -= dt;
+      if (s.timer <= 0) {
+        z.bleedSockets.splice(i, 1);
+        continue;
+      }
+      s.acc -= dt;
+      if (s.acc <= 0) {
+        s.acc = z.state === 'dead' ? 0.085 : 0.11;
+        worldPos.copy(s.localOffset);
+        s.bone.localToWorld(worldPos);
+        sprayDir.set((Math.random() - 0.5) * 0.7, 1.0, (Math.random() - 0.5) * 0.7).normalize();
+        this.vfx.spawnBleedDrip(worldPos, sprayDir);
+      }
+    }
+  }
+
+  /** Severs a head, arm, or leg directly off a zombie skeleton, attaches a bloody bone stump, and launches the Blender .glb gib. */
+  private severPart(
+    z: ZombieInstance,
+    part: 'head' | 'arm_l' | 'arm_r' | 'leg_l' | 'leg_r',
+    impulseDir: THREE.Vector3,
+    power = 1.0
+  ): boolean {
+    if (part === 'head' && z.dismembered.head) return false;
+    if (part === 'arm_l' && z.dismembered.armL) return false;
+    if (part === 'arm_r' && z.dismembered.armR) return false;
+    if (part === 'leg_l' && z.dismembered.legL) return false;
+    if (part === 'leg_r' && z.dismembered.legR) return false;
+
+    const targetBone =
+      part === 'head'
+        ? z.bones.head
+        : part === 'arm_l'
+        ? z.bones.upperArmL ?? z.bones.lowerArmL
+        : part === 'arm_r'
+        ? z.bones.upperArmR ?? z.bones.lowerArmR
+        : part === 'leg_l'
+        ? z.bones.upperLegL ?? z.bones.lowerLegL
+        : z.bones.upperLegR ?? z.bones.lowerLegR;
+
+    const worldPos = new THREE.Vector3();
+    if (targetBone) {
+      targetBone.getWorldPosition(worldPos);
+      targetBone.scale.setScalar(0.001);
+    } else {
+      const yFrac = part === 'head' ? 0.85 : part.startsWith('arm') ? 0.58 : 0.26;
+      worldPos.copy(z.group.position).add(new THREE.Vector3(0, z.height * yFrac, 0));
+    }
+
+    // Remove the severed limb's hitbox so shots pass through empty air where the limb used to be
+    const hb = z.hitboxes[part];
+    if (hb) {
+      z.group.remove(hb);
+      delete z.hitboxes[part];
+    }
+
+    if (part === 'head') {
+      z.dismembered.head = true;
+    } else if (part === 'arm_l') {
+      z.dismembered.armL = true;
+      z.damage = Math.max(5, Math.round(z.damage * 0.8));
+    } else if (part === 'arm_r') {
+      z.dismembered.armR = true;
+      z.damage = Math.max(5, Math.round(z.damage * 0.8));
+    } else if (part === 'leg_l') {
+      z.dismembered.legL = true;
+      z.speed = Math.max(0.65, z.speed * 0.45);
+    } else {
+      z.dismembered.legR = true;
+      z.speed = Math.max(0.65, z.speed * 0.45);
+    }
+
+    // Attach glistening Blender-sculpted bloody bone stump to parent bone so it isn't scaled down
+    if (targetBone && targetBone.parent && this.assets.hasModel('gib_stump')) {
+      const stump = this.assets.cloneModel('gib_stump');
+      stump.position.copy(targetBone.position);
+      stump.scale.setScalar(part === 'head' ? 0.96 : 0.78);
+      if (part === 'head') {
+        stump.rotation.x = Math.PI / 2;
+      } else {
+        const outDir = targetBone.position.clone();
+        if (outDir.lengthSq() > 0.0001) {
+          stump.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), outDir.normalize());
+        }
+      }
+      stump.traverse((o) => {
+        if ((o as THREE.Mesh).isMesh) {
+          const m = o as THREE.Mesh;
+          m.material = Array.isArray(m.material) ? m.material.map((mm) => mm.clone()) : m.material.clone();
+          m.raycast = () => {};
+          z.meshes.push(m);
+        }
+      });
+      targetBone.parent.add(stump);
+      z.bleedSockets.push({
+        bone: targetBone.parent,
+        localOffset: targetBone.position.clone(),
+        timer: part === 'head' ? 2.2 : 3.6,
+        acc: 0,
+      });
+    }
+
+    const gibScale = z.group.scale.x * (z.archetype === 'brute' ? 0.98 : 0.94);
+    const gibKey =
+      part === 'head'
+        ? z.archetype === 'brute'
+          ? 'gib_brute_head'
+          : 'gib_head'
+        : part === 'arm_l'
+        ? 'gib_arm_l'
+        : part === 'arm_r'
+        ? 'gib_arm_r'
+        : part === 'leg_l'
+        ? 'gib_leg_l'
+        : 'gib_leg_r';
+
+    if (targetBone || part === 'head') {
+      this.vfx.spawnGib(gibKey, worldPos, impulseDir, gibScale, power);
+    } else {
+      this.vfx.spawnGib('gib_chunk', worldPos, impulseDir, gibScale, power);
+    }
+
+    // Extra visceral meat chunk on decapitation or heavy power shots
+    if (part === 'head' || power > 1.1) {
+      this.vfx.spawnGib('gib_chunk', worldPos, impulseDir, gibScale * 0.92, power * 1.1);
+    }
+
+    const sprayDir = impulseDir.clone().multiplyScalar(0.75).add(new THREE.Vector3(0, 0.72, 0)).normalize();
+    this.vfx.spawnArterialSpray(worldPos, sprayDir, part === 'head' ? 24 : 18, part === 'head' ? 5.4 : 4.6);
+    this.vfx.spawnBloodSplat(
+      new THREE.Vector3(worldPos.x + impulseDir.x * 0.7, 0.078, worldPos.z + impulseDir.z * 0.7),
+      UP,
+      part === 'head' ? 1.35 : 1.0
+    );
+    this.audio.playDismember(worldPos, part === 'head' || power > 1.15);
+    return true;
+  }
+
+  /** Picks the closest intact limb to a hit position so bullets blow off the exact zombie limb shot. */
+  private pickLimbNear(
+    z: ZombieInstance,
+    hitPoint: THREE.Vector3,
+    maxDist: number,
+    includeLegs = false
+  ): 'arm_l' | 'arm_r' | 'leg_l' | 'leg_r' | null {
+    const tmp = new THREE.Vector3();
+    let best: 'arm_l' | 'arm_r' | 'leg_l' | 'leg_r' | null = null;
+    let bestD = maxDist;
+
+    const candidates: ['arm_l' | 'arm_r' | 'leg_l' | 'leg_r', boolean, THREE.Object3D | undefined][] = [
+      ['arm_l', z.dismembered.armL, z.bones.upperArmL ?? z.bones.lowerArmL],
+      ['arm_r', z.dismembered.armR, z.bones.upperArmR ?? z.bones.lowerArmR],
+    ];
+    if (includeLegs) {
+      candidates.push(
+        ['leg_l', z.dismembered.legL, z.bones.upperLegL ?? z.bones.lowerLegL],
+        ['leg_r', z.dismembered.legR, z.bones.upperLegR ?? z.bones.lowerLegR]
+      );
+    }
+
+    for (const [key, gone, bone] of candidates) {
+      if (gone || !bone) continue;
+      bone.getWorldPosition(tmp);
+      const d = tmp.distanceTo(hitPoint);
+      if (d < bestD) {
+        bestD = d;
+        best = key;
+      }
+    }
+    return best;
+  }
+
   private applyDamage(
     z: ZombieInstance,
     damage: number,
     hitPoint: THREE.Vector3,
     hitNormal: THREE.Vector3,
     impulseDir: THREE.Vector3,
-    headshot: boolean
+    headshot: boolean,
+    opts: DamageOptions = {}
   ): ZombieHitResult {
-    const dmg = headshot ? damage * 2.2 : damage;
+    const dmg = headshot ? damage * 2.4 : damage;
     z.hp -= dmg;
     z.hitFlashTimer = 0.13;
-    z.staggerTimer = Math.max(z.staggerTimer, z.archetype === 'brute' ? 0.08 : headshot ? 0.34 : 0.19);
+    z.staggerTimer = Math.max(z.staggerTimer, z.archetype === 'brute' ? 0.08 : headshot ? 0.34 : 0.2);
     // Interrupt normal windup on stagger (Brutes have hyper-armor once slamming!)
     if (z.archetype !== 'brute' && z.attackPhase === 'windup') {
       z.attackPhase = 'none';
@@ -428,12 +698,40 @@ export class ZombieManager {
     z.body.velocity.x += impulseDir.x * knock;
     z.body.velocity.z += impulseDir.z * knock;
 
-    this.vfx.spawnBloodBurst(hitPoint, hitNormal, headshot ? 16 : 8);
+    this.vfx.spawnBloodBurst(hitPoint, hitNormal, headshot ? 20 : opts.heavy ? 16 : 12);
     const now = performance.now();
     if (now - this.lastFleshSound > 45) {
       this.lastFleshSound = now;
-      this.audio.playPositional('impact_flesh', hitPoint, 0.5, 0.12, 6);
+      this.audio.playPositional('impact_flesh', hitPoint, 0.58, 0.12, 6);
     }
+
+    let dismembered: DismemberPart | undefined;
+    const zone = opts.hitZone;
+
+    // Live zombie dismemberment: shooting a zombie's arm or leg immediately breaks that limb off!
+    if (!opts.explosion && z.hp > 0) {
+      if (zone === 'arm_l' || zone === 'arm_r') {
+        if (this.severPart(z, zone, impulseDir, opts.heavy ? 1.25 : 1.05)) {
+          dismembered = zone;
+          z.staggerTimer = Math.max(z.staggerTimer, z.archetype === 'brute' ? 0.28 : 0.48);
+        }
+      } else if (zone === 'leg_l' || zone === 'leg_r') {
+        if ((dmg >= 20 || z.hp <= z.maxHp * 0.78) && this.severPart(z, zone, impulseDir, opts.heavy ? 1.25 : 1.05)) {
+          dismembered = zone;
+          z.staggerTimer = Math.max(z.staggerTimer, z.archetype === 'brute' ? 0.32 : 0.55);
+          // Losing both legs kills the zombie outright
+          if (z.dismembered.legL && z.dismembered.legR) z.hp = 0;
+        }
+      } else if (!headshot && (opts.heavy || opts.melee || z.hp <= z.maxHp * 0.65)) {
+        // Torso hits around half health, shotgun blasts, or axe swings snap off the closest intact arm
+        const side = this.pickLimbNear(z, hitPoint, 1.8, false);
+        if (side && this.severPart(z, side, impulseDir, opts.heavy ? 1.25 : 1.0)) {
+          dismembered = side;
+          z.staggerTimer = Math.max(z.staggerTimer, z.archetype === 'brute' ? 0.25 : 0.46);
+        }
+      }
+    }
+
     if (z.hp > 0 && now > z.hurtVoiceAt) {
       z.hurtVoiceAt = now + 650;
       z.groanTimer = Math.max(z.groanTimer, 1.5);
@@ -443,10 +741,47 @@ export class ZombieManager {
     if (z.hp > 0 && z.archetype !== 'brute') this.playZombieAnim(z, 'hit', 1.4, true);
     if (z.hp <= 0) {
       if (headshot) this.headshots++;
+      if (opts.explosion) {
+        // Catastrophic blast gibbing: blow zombie completely apart
+        this.severPart(z, 'head', impulseDir, 1.45);
+        this.severPart(z, 'arm_l', impulseDir, 1.35);
+        this.severPart(z, 'arm_r', impulseDir, 1.35);
+        this.severPart(z, 'leg_l', impulseDir, 1.25);
+        for (let k = 0; k < 3; k++) {
+          this.vfx.spawnGib('gib_chunk', hitPoint, impulseDir, z.group.scale.x, 1.35);
+        }
+        dismembered = 'gib';
+      } else if (headshot) {
+        // Fatal headshots pop the zombie's head right off with an arterial neck fountain
+        if (this.severPart(z, 'head', impulseDir, opts.heavy ? 1.35 : 1.1)) {
+          dismembered = 'head';
+        }
+      } else if (zone === 'arm_l' || zone === 'arm_r' || zone === 'leg_l' || zone === 'leg_r') {
+        if (this.severPart(z, zone, impulseDir, opts.heavy ? 1.3 : 1.05)) {
+          dismembered = zone;
+        }
+      } else if (!dismembered) {
+        // On every body kill, visibly break off a limb or head + bloody gore chunk so zombies fall apart dramatically
+        const limb = this.pickLimbNear(z, hitPoint, 2.4, true);
+        if (limb && this.severPart(z, limb, impulseDir, opts.heavy ? 1.3 : 1.05)) {
+          dismembered = limb;
+        } else if (this.severPart(z, 'head', impulseDir, 1.2)) {
+          dismembered = 'head';
+        } else {
+          this.vfx.spawnGib('gib_chunk', hitPoint, impulseDir, z.group.scale.x * 0.95, 1.05);
+          dismembered = 'gib';
+        }
+        // Shotgun / Sniper / Axe kills blow off an extra part too!
+        if (opts.heavy || opts.melee) {
+          const second = this.pickLimbNear(z, hitPoint, 2.8, true);
+          if (second) this.severPart(z, second, impulseDir, 1.25);
+          else this.severPart(z, 'head', impulseDir, 1.25);
+        }
+      }
       this.killZombie(z, impulseDir);
-      return { killed: true, headshot };
+      return { killed: true, headshot, dismembered };
     }
-    return { killed: false, headshot };
+    return { killed: false, headshot, dismembered };
   }
 
   public damageZombieByObject(
@@ -454,16 +789,18 @@ export class ZombieManager {
     damage: number,
     hitPoint: THREE.Vector3,
     hitNormal: THREE.Vector3,
-    impulseDir: THREE.Vector3
+    impulseDir: THREE.Vector3,
+    opts: DamageOptions = {}
   ): ZombieHitResult | null {
     const id = obj.userData.zombieId as string | undefined;
     if (!id) return null;
     const z = this.zombies.find((item) => item.id === id);
     if (!z) return null;
     if (z.state === 'dead') return { killed: false, headshot: false };
-    const headY = z.height * 0.78;
-    const headshot = hitPoint.y - z.group.position.y > headY;
-    return this.applyDamage(z, damage, hitPoint, hitNormal, impulseDir, headshot);
+    const hitZone = obj.userData.hitZone as HitZone | undefined;
+    const headY = z.height * 0.72;
+    const headshot = hitZone === 'head' || (!hitZone && hitPoint.y - z.group.position.y > headY);
+    return this.applyDamage(z, damage, hitPoint, hitNormal, impulseDir, headshot, { ...opts, hitZone });
   }
 
   /** Melee sweep: hits up to 2 zombies in a frontal arc. */
@@ -480,9 +817,9 @@ export class ZombieManager {
     candidates.sort((a, b) => a.d - b.d);
     const results: ZombieHitResult[] = [];
     for (const { z } of candidates.slice(0, 2)) {
-      const hitPoint = z.group.position.clone().setY(z.height * 0.65);
+      const hitPoint = z.group.position.clone().setY(z.height * 0.68);
       const normal = forward.clone().negate();
-      results.push(this.applyDamage(z, damage, hitPoint, normal, forward, false));
+      results.push(this.applyDamage(z, damage, hitPoint, normal, forward, false, { melee: true }));
       z.staggerTimer = Math.max(z.staggerTimer, 0.45);
     }
     return results;
@@ -499,7 +836,10 @@ export class ZombieManager {
       const falloff = Math.pow(1 - d / radius, 0.6);
       const dir = d > 0.01 ? to.normalize() : new THREE.Vector3(1, 0, 0);
       const hitPoint = z.group.position.clone().setY(z.height * 0.6);
-      const res = this.applyDamage(z, damage * falloff, hitPoint, dir.clone().setY(0.4).normalize(), dir, false);
+      const res = this.applyDamage(z, damage * falloff, hitPoint, dir.clone().setY(0.4).normalize(), dir, false, {
+        heavy: true,
+        explosion: true,
+      });
       if (res.killed) kills++;
       else {
         z.body.velocity.x += dir.x * 12 * falloff;
@@ -550,7 +890,6 @@ export class ZombieManager {
   private disposeZombie(z: ZombieInstance): void {
     this.scene.remove(z.group);
     z.mixer?.stopAllAction();
-    (z.group.userData.hitbox as THREE.Mesh | undefined)?.geometry.dispose();
     for (const m of z.meshes) {
       const mats = Array.isArray(m.material) ? m.material : [m.material];
       mats.forEach((mat) => mat.dispose());
@@ -614,6 +953,8 @@ export class ZombieManager {
         // Collapse plays once and holds, then smoothly disintegrates into glowing embers & ash
         z.deathTimer -= dt;
         if (z.mixer && z.deathTimer > 3.6) z.mixer.update(dt);
+        this.enforceSeveredBones(z);
+        this.updateBleedSockets(z, dt);
         if (z.deathTimer < 1.8) {
           const alpha = THREE.MathUtils.clamp(z.deathTimer / 1.8, 0, 1);
           z.dissolveEmitTimer -= dt;
@@ -644,6 +985,8 @@ export class ZombieManager {
       }
 
       if (z.mixer) z.mixer.update(dt);
+      this.enforceSeveredBones(z);
+      this.updateBleedSockets(z, dt);
 
       // Decay directional hit flinch smoothly
       z.flinchPitch = THREE.MathUtils.lerp(z.flinchPitch, 0, Math.min(1, dt * 11));

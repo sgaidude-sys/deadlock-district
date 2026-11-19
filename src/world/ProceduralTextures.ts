@@ -622,3 +622,92 @@ export function tiledPBR(set: PBRSet, rx: number, ry: number): PBRSet {
     roughnessMap: tiled(set.roughnessMap, rx, ry),
   };
 }
+
+let cachedBloodSplats: THREE.Texture[] | null = null;
+
+/** Three distinct organic high-velocity wet blood splatter textures for wall/ground/vehicle decals. */
+export function bloodSplatTextures(): THREE.Texture[] {
+  if (cachedBloodSplats) return cachedBloodSplats;
+  cachedBloodSplats = [0, 1, 2].map((variant) => {
+    const size = 256;
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d')!;
+    const rand = seeded(4117 + variant * 997);
+    const cx = size * 0.5;
+    const cy = size * 0.5;
+
+    g.clearRect(0, 0, size, size);
+
+    // Core dark coagulated splash pool built from overlapping organic lobes
+    const lobes = 9 + variant * 2;
+    for (let i = 0; i < lobes; i++) {
+      const a = (i / lobes) * Math.PI * 2 + (rand() - 0.5) * 0.45;
+      const dist = rand() * size * 0.14;
+      const r = size * (0.09 + rand() * 0.11);
+      const x = cx + Math.cos(a) * dist;
+      const y = cy + Math.sin(a) * dist;
+      const grad = g.createRadialGradient(x, y, r * 0.1, x, y, r);
+      grad.addColorStop(0, 'rgba(62, 4, 7, 0.96)');
+      grad.addColorStop(0.58, 'rgba(118, 9, 14, 0.92)');
+      grad.addColorStop(0.86, 'rgba(145, 13, 18, 0.65)');
+      grad.addColorStop(1, 'rgba(145, 13, 18, 0)');
+      g.fillStyle = grad;
+      g.beginPath();
+      g.arc(x, y, r, 0, Math.PI * 2);
+      g.fill();
+    }
+
+    // High-velocity arterial streaks radiating outward from impact center
+    const streaks = 14 + variant * 4;
+    for (let i = 0; i < streaks; i++) {
+      const a = rand() * Math.PI * 2;
+      const len = size * (0.14 + rand() * 0.27);
+      const startR = size * (0.04 + rand() * 0.08);
+      const width = 2.2 + rand() * 6.5;
+      const x0 = cx + Math.cos(a) * startR;
+      const y0 = cy + Math.sin(a) * startR;
+      const x1 = cx + Math.cos(a) * Math.min(size * 0.44, startR + len);
+      const y1 = cy + Math.sin(a) * Math.min(size * 0.44, startR + len);
+
+      g.strokeStyle = rand() < 0.45 ? 'rgba(84, 6, 10, 0.88)' : 'rgba(138, 12, 17, 0.82)';
+      g.lineWidth = width;
+      g.lineCap = 'round';
+      g.beginPath();
+      g.moveTo(x0, y0);
+      g.lineTo(x1, y1);
+      g.stroke();
+
+      // Teardrop bulb at tip of streak
+      g.fillStyle = 'rgba(110, 8, 12, 0.88)';
+      g.beginPath();
+      g.arc(x1, y1, width * (0.45 + rand() * 0.4), 0, Math.PI * 2);
+      g.fill();
+    }
+
+    // Scattered outer satellite droplets (kept inside safe margin so ClampToEdge never smears)
+    for (let i = 0; i < 42; i++) {
+      const a = rand() * Math.PI * 2;
+      const d = size * (0.12 + rand() * 0.31);
+      const x = cx + Math.cos(a) * d;
+      const y = cy + Math.sin(a) * d;
+      const rx = 1.4 + rand() * 5.2;
+      const ry = rx * (0.55 + rand() * 0.85);
+      g.save();
+      g.translate(x, y);
+      g.rotate(a);
+      g.fillStyle = rand() < 0.35 ? 'rgba(68, 5, 8, 0.9)' : 'rgba(148, 14, 19, 0.78)';
+      g.beginPath();
+      g.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
+      g.fill();
+      g.restore();
+    }
+
+    const tex = new THREE.CanvasTexture(c);
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.anisotropy = 4;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  });
+  return cachedBloodSplats;
+}

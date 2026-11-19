@@ -126,6 +126,31 @@ const SFX_KEYS = [
   'loop_record',
 ];
 
+const VOICE_KEYS = [
+  'reyes_01',
+  'reyes_02',
+  'reyes_03',
+  'reyes_04',
+  'reyes_05',
+  'reyes_06',
+  'reyes_07',
+  'reyes_08',
+  'reyes_09',
+  'reyes_10',
+  'reyes_11',
+  'reyes_12',
+  'reyes_13',
+  'reyes_14',
+  'reyes_15',
+  'reyes_16',
+  'reyes_17',
+  'reyes_18',
+  'reyes_callout_headshot',
+  'reyes_callout_limb',
+  'reyes_callout_lowhp',
+  'reyes_callout_dog',
+];
+
 export const ASSET_MANIFEST: AssetEntry[] = [
   // Survivors & companion (rigs carry every weapon on the hand bone; feet already at y = 0)
   { key: 'survivor_matt', url: C('Characters_Matt'), type: 'gltf' },
@@ -139,6 +164,16 @@ export const ASSET_MANIFEST: AssetEntry[] = [
   { key: 'zombie_chubby', url: C('Zombie_Chubby'), type: 'gltf' },
   { key: 'zombie_arm', url: C('Zombie_Arm'), type: 'gltf' },
   { key: 'zombie_ribcage', url: C('Zombie_Ribcage'), type: 'gltf' },
+
+  // Blender-sliced severed zombie body parts & bloody bone stumps (centerGround omitted so COM stays centered for tumbling)
+  { key: 'gib_head', url: '/assets/gibs/gib_head.glb', type: 'gltf' },
+  { key: 'gib_brute_head', url: '/assets/gibs/gib_brute_head.glb', type: 'gltf' },
+  { key: 'gib_arm_l', url: '/assets/gibs/gib_arm_l.glb', type: 'gltf' },
+  { key: 'gib_arm_r', url: '/assets/gibs/gib_arm_r.glb', type: 'gltf' },
+  { key: 'gib_leg_l', url: '/assets/gibs/gib_leg_l.glb', type: 'gltf' },
+  { key: 'gib_leg_r', url: '/assets/gibs/gib_leg_r.glb', type: 'gltf' },
+  { key: 'gib_chunk', url: '/assets/gibs/gib_chunk.glb', type: 'gltf' },
+  { key: 'gib_stump', url: '/assets/gibs/gib_stump.glb', type: 'gltf' },
 
   // Streets
   { key: 'street_straight', url: E('Street_Straight'), type: 'gltf' },
@@ -220,6 +255,9 @@ export const ASSET_MANIFEST: AssetEntry[] = [
 
   // Sound effects: 800-game-sound-effects, normalised OGG (via scripts/prepare_assets.py)
   ...SFX_KEYS.map((key): AssetEntry => ({ key, url: `/assets/sfx/${key}.ogg`, type: 'audio' })),
+
+  // Captain Reyes studio-mastered Kokoro-82M radio voiceovers (via scripts/generate_kokoro_voices.py)
+  ...VOICE_KEYS.map((key): AssetEntry => ({ key: `voice_${key}`, url: `/assets/voice/${key}.ogg`, type: 'audio' })),
 ];
 
 export class AssetManager {
@@ -282,8 +320,11 @@ export class AssetManager {
       const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       for (const m of mats) {
         if (m instanceof THREE.MeshStandardMaterial) {
-          m.roughness = Math.max(0.55, m.roughness);
-          m.metalness = Math.min(0.2, m.metalness);
+          // Preserve glossy wet blood & flesh specular highlights on Blender gore meshes
+          if (!/WetGore|DarkBlood/i.test(m.name)) {
+            m.roughness = Math.max(0.55, m.roughness);
+            m.metalness = Math.min(0.2, m.metalness);
+          }
         }
       }
     });
