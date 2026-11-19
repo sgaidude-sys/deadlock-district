@@ -9,6 +9,15 @@ export class InputManager {
   public hasEverLocked = false;
   public sensitivity = 0.0022;
 
+  // Dual-input touch / drag fallback state
+  public touchMoveX = 0;
+  public touchMoveY = 0;
+  public touchFireHeld = false;
+  public touchAimHeld = false;
+  private dragLooking = false;
+  private lastDragX = 0;
+  private lastDragY = 0;
+
   private onKeyPressCallbacks = new Map<string, Array<() => void>>();
   private lockChangeCallbacks: Array<(locked: boolean) => void> = [];
   private wheelCallbacks: Array<(dir: number) => void> = [];
@@ -22,14 +31,24 @@ export class InputManager {
     window.addEventListener('mousedown', this.handleMouseDown);
     window.addEventListener('mouseup', this.handleMouseUp);
     window.addEventListener('wheel', this.handleWheel, { passive: true });
-    window.addEventListener('blur', () => this.releaseAll());
-    window.addEventListener('contextmenu', (e) => e.preventDefault());
+    window.addEventListener('blur', this.handleBlur);
+    window.addEventListener('contextmenu', this.handleContextMenu);
     document.addEventListener('pointerlockchange', this.handlePointerLockChange);
-    this.domElement.addEventListener('click', () => {
-      if (!this.isPointerLocked && (!this.canLockChecker || this.canLockChecker())) {
-        this.requestPointerLock();
-      }
-    });
+    this.domElement.addEventListener('click', this.handleCanvasClick);
+  }
+
+  public dispose(): void {
+    this.exitPointerLock();
+    window.removeEventListener('keydown', this.handleKeyDown);
+    window.removeEventListener('keyup', this.handleKeyUp);
+    window.removeEventListener('mousemove', this.handleMouseMove);
+    window.removeEventListener('mousedown', this.handleMouseDown);
+    window.removeEventListener('mouseup', this.handleMouseUp);
+    window.removeEventListener('wheel', this.handleWheel);
+    window.removeEventListener('blur', this.handleBlur);
+    window.removeEventListener('contextmenu', this.handleContextMenu);
+    document.removeEventListener('pointerlockchange', this.handlePointerLockChange);
+    this.domElement.removeEventListener('click', this.handleCanvasClick);
   }
 
   public setCanLockChecker(fn: () => boolean): void {
@@ -44,10 +63,30 @@ export class InputManager {
     this.wheelCallbacks.push(cb);
   }
 
+  /** Triggers a registered key press programmatically (used by touch HUD buttons). */
+  public triggerKeyPress(code: string): void {
+    const cbs = this.onKeyPressCallbacks.get(code);
+    if (cbs) for (const cb of cbs) cb();
+  }
+
+  /** Dual-input fire check: LMB (when locked), keyboard J / Enter, or touch fire button. */
+  public isFireHeld(): boolean {
+    return (this.isPointerLocked && this.leftMouseDown) || this.keys.has('KeyJ') || this.keys.has('Enter') || this.touchFireHeld;
+  }
+
+  /** Dual-input ADS aim check: RMB (when locked), keyboard K, or touch aim button. */
+  public isAimHeld(): boolean {
+    return (this.isPointerLocked && this.rightMouseDown) || this.keys.has('KeyK') || this.touchAimHeld;
+  }
+
+  public addLookDelta(dxPixels: number, dyPixels: number): void {
+    this.mouseDeltaX += dxPixels * this.sensitivity * 1.4;
+    this.mouseDeltaY += dyPixels * this.sensitivity * 1.4;
+  }
+
   public requestPointerLock(): void {
     try {
       if (document.pointerLockElement !== this.domElement) {
-        // Raw, unaccelerated mouse input where supported (Chrome/Edge); plain lock otherwise.
         const req = this.domElement.requestPointerLock as unknown as (opts?: object) => Promise<void> | undefined;
         const res = req.call(this.domElement, { unadjustedMovement: true });
         if (res && typeof res.catch === 'function') {
@@ -90,7 +129,20 @@ export class InputManager {
     this.keys.clear();
     this.leftMouseDown = false;
     this.rightMouseDown = false;
+    this.dragLooking = false;
+    this.touchFireHeld = false;
+    this.touchAimHeld = false;
+    this.touchMoveX = 0;
+    this.touchMoveY = 0;
   }
+
+  private handleBlur = (): void => this.releaseAll();
+  private handleContextMenu = (e: MouseEvent): void => e.preventDefault();
+  private handleCanvasClick = (): void => {
+    if (!this.isPointerLocked && (!this.canLockChecker || this.canLockChecker())) {
+      this.requestPointerLock();
+    }
+  };
 
   private handleKeyDown = (e: KeyboardEvent): void => {
     if (e.target instanceof HTMLInputElement) return;
@@ -111,24 +163,40 @@ export class InputManager {
   };
 
   private handleMouseMove = (e: MouseEvent): void => {
-    if (!this.isPointerLocked) return;
-    // Chrome on Windows occasionally reports a bogus huge jump under pointer lock (and on the
-    // first event after locking), which whips the camera around. Real hand motion never moves
-    // hundreds of pixels in one event, so drop those outliers.
-    if (Math.abs(e.movementX) > 250 || Math.abs(e.movementY) > 250) return;
-    this.mouseDeltaX += e.movementX * this.sensitivity;
-    this.mouseDeltaY += e.movementY * this.sensitivity;
+    if (this.isPointerLocked) {
+      if (Math.abs(e.movementX) > 250 || Math.abs(e.movementY) > 250) return;
+      this.mouseDeltaX += e.movementX * this.sensitivity;
+      this.mouseDeltaY += e.movementY * this.sensitivity;
+    } else if (this.dragLooking) {
+      const dx = e.clientX - this.lastDragX;
+      const dy = e.clientY - this.lastDragY;
+      this.lastDragX = e.clientX;
+      this.lastDragY = e.clientY;
+      this.mouseDeltaX += dx * this.sensitivity * 1.4;
+      this.mouseDeltaY += dy * this.sensitivity * 1.4;
+    }
   };
 
   private handleMouseDown = (e: MouseEvent): void => {
-    if (!this.isPointerLocked) return;
+    if (!this.isPointerLocked) {
+      // Allow RMB drag-look fallback when pointer lock isn't engaged
+      if (e.button === 2 && e.target === this.domElement && (!this.canLockChecker || this.canLockChecker())) {
+        this.dragLooking = true;
+        this.lastDragX = e.clientX;
+        this.lastDragY = e.clientY;
+      }
+      return;
+    }
     if (e.button === 0) this.leftMouseDown = true;
     if (e.button === 2) this.rightMouseDown = true;
   };
 
   private handleMouseUp = (e: MouseEvent): void => {
     if (e.button === 0) this.leftMouseDown = false;
-    if (e.button === 2) this.rightMouseDown = false;
+    if (e.button === 2) {
+      this.rightMouseDown = false;
+      this.dragLooking = false;
+    }
   };
 
   private handleWheel = (e: WheelEvent): void => {

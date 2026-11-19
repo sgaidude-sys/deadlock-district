@@ -13,21 +13,6 @@ export interface LoopHandle {
   stop(fade?: number): void;
 }
 
-const MUSIC_DIR = '/assets/music/JDSherbert - Ambiences Music Pack - ';
-/**
- * Tracks chosen by measured character (onset density / loudness), gains normalise each track to
- * about -21 LUFS so crossfades don't jump in level.
- */
-const MUSIC = {
-  title: { file: 'Frost Mountain Aura.ogg', gain: 0.67 },
-  day: { file: 'Dark Dark Woods.ogg', gain: 1.58 },
-  night: { file: 'Bloodrat Sewers.ogg', gain: 1.46 },
-  combat: { file: 'Tiger Temple Trial.ogg', gain: 0.85 },
-  siege: { file: 'Swamp of Digeridoos.ogg', gain: 0.46 },
-  jukebox: { file: 'Junction Jazz.ogg', gain: 0.8 },
-} as const;
-type MusicLayer = 'title' | 'day' | 'night' | 'combat' | 'siege';
-
 /** Randomised alternatives for one-shots, paired with a no-repeat shuffle guard. */
 const VARIANTS: Record<string, string[]> = {
   gun_pistol: ['gun_pistol', 'gun_pistol2'],
@@ -49,11 +34,16 @@ const VARIANTS: Record<string, string[]> = {
 };
 
 const MAX_CONCURRENT_ONESHOTS = 36;
+// D minor / Phrygian survival palette (Hz)
+const MARIMBA_SCALE = [293.66, 311.13, 349.23, 440.0, 466.16, 523.25, 587.33];
+const BASS_PATTERN = [73.42, 73.42, 87.31, 73.42, 65.41, 73.42, 98.0, 82.41];
 
 /**
- * Multi-bus mastering audio graph:
+ * Multi-bus mastering audio engine combining loaded SFX with a 100% self-contained procedural
+ * Web Audio adaptive soundtrack, procedural SFX fallbacks, and speechSynthesis radio voice comms:
+ *
  *   sfxBus ─────────────────────────────────────────┐
- *   musicBus ──> duckGain ──────────────────────────┼─> listener.gain (master) -> muffle LP -> compressor/limiter -> out
+ *   musicBus (procedural synth) ──> duckGain ───────┼─> listener.gain (master) -> muffle LP -> compressor -> out
  *   ambienceBus -> indoorLP -> duckGain ────────────┤
  *   reverbBus -> convolver ─────────────────────────┘
  */
@@ -72,24 +62,35 @@ export class AudioManager {
   private muffle: BiquadFilterNode;
   private compressor: DynamicsCompressorNode;
 
-  private music = new Map<MusicLayer, { el: HTMLAudioElement; gain: GainNode; base: number }>();
-  private musicWeights: Record<MusicLayer, number> = { title: 0, day: 0, night: 0, combat: 0, siege: 0 };
+  // Procedural adaptive soundtrack state
+  private droneOsc1: OscillatorNode | null = null;
+  private droneOsc2: OscillatorNode | null = null;
+  private droneGain: GainNode | null = null;
+  private droneFilter: BiquadFilterNode | null = null;
   private titleStarted = false;
   private gameMusicStarted = false;
   private nightAmount = 0;
   private combatAmount = 0;
   private combatTarget = 0;
   private siege = false;
+  private beatAccum = 0;
+  private stepIndex = 0;
+  private marimbaTimer = 1.4;
 
+  // Ambience & active loops
   private wind: LoopHandle | null = null;
   private crickets: LoopHandle | null = null;
   private eerie: LoopHandle | null = null;
   private rain: LoopHandle | null = null;
+  private activeLoops: LoopHandle[] = [];
   private rainAmount = 0;
 
   private masterVolume = 0.8;
   private busVolumes: Record<AudioBus, number> = { music: 0.8, sfx: 0.9, ambience: 0.85 };
   private muted = false;
+  private voiceEnabled = true;
+  private disposed = false;
+
   private muffleAmount = 0;
   private muffleTarget = 0;
   private indoorsAmount = 0;
@@ -106,6 +107,7 @@ export class AudioManager {
   private lastVariant = new Map<string, number>();
   private noiseBuffer: AudioBuffer;
   private soundListeners: SoundEmissionListener[] = [];
+  private unlockHandler: () => void;
 
   constructor(assets: AssetManager) {
     this.assets = assets;
@@ -130,7 +132,7 @@ export class AudioManager {
     this.compressor.connect(this.ctx.destination);
     this.listener.setMasterVolume(this.masterVolume);
 
-    // Independent Gain Buses + Ducking & Indoor Filtering
+    // Independent Gain Buses + Sidechain Ducking & Indoor Filtering
     this.sfxBus = this.ctx.createGain();
     this.sfxBus.connect(this.listener.getInput());
 
@@ -153,9 +155,9 @@ export class AudioManager {
 
     // Street-echo reverb: procedural impulse response (decaying, darkening reflections)
     this.reverbBus = this.ctx.createGain();
-    this.reverbBus.gain.value = 0.52;
+    this.reverbBus.gain.value = 0.48;
     const convolver = this.ctx.createConvolver();
-    convolver.buffer = this.makeImpulse(2.6, 2.8);
+    convolver.buffer = this.makeImpulse(2.4, 2.8);
     this.reverbBus.connect(convolver).connect(this.listener.getInput());
 
     const len = this.ctx.sampleRate * 2;
@@ -163,22 +165,43 @@ export class AudioManager {
     const data = this.noiseBuffer.getChannelData(0);
     for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
 
-    // Browsers only allow audio after a gesture; unlock + start the title theme on the first one.
-    const unlock = () => {
+    this.unlockHandler = () => {
+      if (this.disposed) return;
       this.resume();
       this.startTitleMusic();
-      window.removeEventListener('pointerdown', unlock);
-      window.removeEventListener('keydown', unlock);
+      window.removeEventListener('pointerdown', this.unlockHandler);
+      window.removeEventListener('keydown', this.unlockHandler);
     };
-    window.addEventListener('pointerdown', unlock);
-    window.addEventListener('keydown', unlock);
+    window.addEventListener('pointerdown', this.unlockHandler);
+    window.addEventListener('keydown', this.unlockHandler);
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    this.stopSpeech();
+    window.removeEventListener('pointerdown', this.unlockHandler);
+    window.removeEventListener('keydown', this.unlockHandler);
+    for (const loop of this.activeLoops) loop.stop(0.05);
+    this.activeLoops = [];
+    try {
+      this.droneOsc1?.stop();
+      this.droneOsc2?.stop();
+    } catch {
+      /* already stopped */
+    }
+    this.droneOsc1?.disconnect();
+    this.droneOsc2?.disconnect();
+    this.droneFilter?.disconnect();
+    this.droneGain?.disconnect();
+    this.listener.setMasterVolume(0);
   }
 
   private applyBusVolumes(): void {
+    if (this.disposed) return;
     const now = this.ctx.currentTime;
     this.sfxBus.gain.setTargetAtTime(0.85 * this.busVolumes.sfx, now, 0.04);
-    this.musicBus.gain.setTargetAtTime(0.32 * this.busVolumes.music, now, 0.04);
-    this.ambienceBus.gain.setTargetAtTime(1.0 * this.busVolumes.ambience, now, 0.04);
+    this.musicBus.gain.setTargetAtTime(0.55 * this.busVolumes.music, now, 0.04);
+    this.ambienceBus.gain.setTargetAtTime(0.95 * this.busVolumes.ambience, now, 0.04);
   }
 
   private makeImpulse(seconds: number, decay: number): AudioBuffer {
@@ -204,6 +227,7 @@ export class AudioManager {
   }
 
   public resume(): void {
+    if (this.disposed) return;
     if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
   }
 
@@ -215,7 +239,7 @@ export class AudioManager {
     for (const cb of this.soundListeners) cb(origin, radius);
   }
 
-  /** Smoothly ducks music & ambience buses so explosions, sirens, and radio comms cut through clearly. */
+  /** Smoothly ducks music & ambience buses so dialogue, sirens, and blasts cut through clearly. */
   public duck(amount: number, holdSeconds = 1.2): void {
     this.duckAmount = Math.max(this.duckAmount, THREE.MathUtils.clamp(amount, 0, 0.85));
     this.duckHoldTimer = Math.max(this.duckHoldTimer, holdSeconds);
@@ -226,39 +250,47 @@ export class AudioManager {
     this.indoorsTarget = indoors ? 1 : 0;
   }
 
-  // ───────────────────────────── Music ─────────────────────────────
+  // ───────────────────────────── Procedural Adaptive Soundtrack ─────────────────────────────
 
-  private ensureTrack(layer: MusicLayer): void {
-    if (this.music.has(layer)) return;
-    const spec = MUSIC[layer];
-    const el = new Audio(MUSIC_DIR + spec.file);
-    el.loop = true;
-    el.crossOrigin = 'anonymous';
-    const gain = this.ctx.createGain();
-    gain.gain.value = 0;
-    try {
-      this.ctx.createMediaElementSource(el).connect(gain);
-      gain.connect(this.musicBus);
-    } catch {
-      /* element will play directly */
-    }
-    el.play().catch(() => {});
-    this.music.set(layer, { el, gain, base: spec.gain });
+  private initDroneBed(): void {
+    if (this.droneOsc1 || this.disposed) return;
+    const now = this.ctx.currentTime;
+    this.droneFilter = this.ctx.createBiquadFilter();
+    this.droneFilter.type = 'lowpass';
+    this.droneFilter.frequency.value = 260;
+    this.droneFilter.Q.value = 1.8;
+
+    this.droneGain = this.ctx.createGain();
+    this.droneGain.gain.setValueAtTime(0.0001, now);
+    this.droneGain.gain.linearRampToValueAtTime(0.16, now + 2.0);
+
+    this.droneOsc1 = this.ctx.createOscillator();
+    this.droneOsc1.type = 'sawtooth';
+    this.droneOsc1.frequency.value = 73.42; // D2 dark root
+
+    this.droneOsc2 = this.ctx.createOscillator();
+    this.droneOsc2.type = 'triangle';
+    this.droneOsc2.frequency.value = 110.0; // A2 fifth harmonic
+    this.droneOsc2.detune.value = -9;
+
+    this.droneOsc1.connect(this.droneFilter);
+    this.droneOsc2.connect(this.droneFilter);
+    this.droneFilter.connect(this.droneGain).connect(this.musicBus);
+    this.droneOsc1.start(now);
+    this.droneOsc2.start(now);
   }
 
   public startTitleMusic(): void {
-    if (this.titleStarted || this.gameMusicStarted) return;
+    if (this.titleStarted || this.gameMusicStarted || this.disposed) return;
     this.titleStarted = true;
-    this.ensureTrack('title');
-    this.musicWeights.title = 1;
+    this.initDroneBed();
   }
 
   public startMusic(): void {
     this.resume();
-    if (this.gameMusicStarted) return;
+    if (this.gameMusicStarted || this.disposed) return;
     this.gameMusicStarted = true;
-    for (const layer of ['day', 'night', 'combat', 'siege'] as MusicLayer[]) this.ensureTrack(layer);
-    this.musicWeights.title = 0;
+    this.initDroneBed();
     this.startAmbience();
   }
 
@@ -269,7 +301,139 @@ export class AudioManager {
     this.siege = siege;
   }
 
-  // ───────────────────────────── Ambience & loops ─────────────────────────────
+  private playSynthNote(
+    type: OscillatorType,
+    freq: number,
+    dur: number,
+    vol: number,
+    cutoff = 1400,
+    dest: AudioNode = this.musicBus,
+    reverb = 0.25
+  ): void {
+    if (this.muted || this.disposed) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+
+    const flt = this.ctx.createBiquadFilter();
+    flt.type = 'lowpass';
+    flt.frequency.setValueAtTime(cutoff, t);
+    flt.frequency.exponentialRampToValueAtTime(Math.max(120, cutoff * 0.28), t + dur);
+
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(vol, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+    osc.connect(flt).connect(g).connect(dest);
+    let revSend: GainNode | null = null;
+    if (reverb > 0) {
+      revSend = this.ctx.createGain();
+      revSend.gain.value = reverb * vol;
+      g.connect(revSend).connect(this.reverbBus);
+    }
+    osc.start(t);
+    osc.stop(t + dur + 0.03);
+    osc.onended = () => {
+      osc.disconnect();
+      flt.disconnect();
+      g.disconnect();
+      revSend?.disconnect();
+    };
+  }
+
+  private playSynthKick(vol: number): void {
+    if (this.muted || this.disposed) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(115, t);
+    osc.frequency.exponentialRampToValueAtTime(36, t + 0.14);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+    osc.connect(g).connect(this.musicBus);
+    osc.start(t);
+    osc.stop(t + 0.24);
+    osc.onended = () => {
+      osc.disconnect();
+      g.disconnect();
+    };
+  }
+
+  private playSynthHat(vol: number): void {
+    if (this.muted || this.disposed) return;
+    const t = this.ctx.currentTime;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const hp = this.ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 6500;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.055);
+    src.connect(hp).connect(g).connect(this.musicBus);
+    src.start(t, Math.random());
+    src.stop(t + 0.07);
+    src.onended = () => {
+      src.disconnect();
+      hp.disconnect();
+      g.disconnect();
+    };
+  }
+
+  private stepProceduralMusic(dt: number): void {
+    if ((!this.titleStarted && !this.gameMusicStarted) || this.muted || this.ctx.state !== 'running') return;
+    const now = this.ctx.currentTime;
+    const tension = this.siege ? 1 : Math.max(this.combatAmount, this.nightAmount * 0.45);
+
+    // Evolve drone filter & subtle ominous detune as night / tension rises
+    if (this.droneFilter && this.droneGain && this.droneOsc2) {
+      const targetCutoff = THREE.MathUtils.lerp(220, 620, tension) + Math.sin(now * 0.35) * 45;
+      this.droneFilter.frequency.setTargetAtTime(targetCutoff, now, 0.35);
+      this.droneGain.gain.setTargetAtTime(THREE.MathUtils.lerp(0.14, 0.24, tension), now, 0.4);
+      // Shift upper drone from calm fifth (A2) toward tense flat-sixth / tritone at night/siege
+      const targetHz = this.siege ? 103.83 : THREE.MathUtils.lerp(110.0, 103.83, this.nightAmount);
+      this.droneOsc2.frequency.setTargetAtTime(targetHz, now, 1.0);
+    }
+
+    // Gentle atmospheric marimba / plucked harmonic pulse during calm exploration & title
+    if (tension < 0.72) {
+      this.marimbaTimer -= dt;
+      if (this.marimbaTimer <= 0) {
+        this.marimbaTimer = THREE.MathUtils.lerp(1.9, 1.05, this.nightAmount) + Math.random() * 1.1;
+        const note = MARIMBA_SCALE[Math.floor(Math.random() * MARIMBA_SCALE.length)] * (this.nightAmount > 0.5 ? 0.5 : 1);
+        this.playSynthNote('triangle', note, 0.85, 0.08 * (1 - tension * 0.65), 1100, this.musicBus, 0.55);
+      }
+    }
+
+    // Rhythmic sub-bass pulse & industrial percussion during combat / night hunt / siege
+    if (this.gameMusicStarted && tension > 0.18) {
+      const bpm = this.siege ? 128 : THREE.MathUtils.lerp(88, 116, tension);
+      const stepDur = 60 / bpm / 2; // eighth-note grid
+      this.beatAccum += dt;
+      if (this.beatAccum >= stepDur) {
+        this.beatAccum -= stepDur;
+        const step = this.stepIndex++ % 8;
+        const bassFreq = BASS_PATTERN[step];
+        const drive = THREE.MathUtils.clamp((tension - 0.18) / 0.82, 0, 1);
+
+        // Pulsing filtered sub-bass
+        this.playSynthNote('sawtooth', bassFreq, stepDur * 0.85, 0.11 * drive, 240 + drive * 460, this.musicBus, 0.1);
+        // Kick on downbeats & syncopated siege hits
+        if (step === 0 || step === 4 || (this.siege && step === 6)) {
+          this.playSynthKick(0.24 * drive);
+        }
+        // Crisp industrial hat tick during intense combat/siege
+        if ((this.siege || this.combatAmount > 0.45) && step % 2 === 1) {
+          this.playSynthHat(0.055 * drive);
+        }
+      }
+    }
+  }
+
+  // ───────────────────────────── Ambience & Loops ─────────────────────────────
 
   private startAmbience(): void {
     this.wind = this.createLoop('loop_wind', null, 0, 1, this.ambienceBus);
@@ -278,7 +442,7 @@ export class AudioManager {
     this.rain = this.createLoop('loop_rain', null, 0, 1, this.ambienceBus);
   }
 
-  /** Looping sample, optionally positioned in the world. Returns a handle to control/stop it. */
+  /** Looping sample (with procedural wind/rain fallback if buffer absent). */
   public createLoop(
     key: string,
     position: THREE.Vector3 | null,
@@ -304,18 +468,31 @@ export class AudioManager {
     } else {
       gain.connect(bus);
     }
+
     let src: AudioBufferSourceNode | null = null;
+    let extraFilter: BiquadFilterNode | null = null;
     if (buf) {
       src = this.ctx.createBufferSource();
       src.buffer = buf;
       src.loop = true;
       src.connect(gain);
       src.start(0, Math.random() * buf.duration);
+    } else if (key === 'loop_wind' || key === 'loop_rain' || key === 'loop_fire') {
+      // Procedural filtered noise bed fallback
+      src = this.ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      src.loop = true;
+      extraFilter = this.ctx.createBiquadFilter();
+      extraFilter.type = key === 'loop_rain' ? 'bandpass' : 'lowpass';
+      extraFilter.frequency.value = key === 'loop_rain' ? 1600 : key === 'loop_fire' ? 420 : 320;
+      src.connect(extraFilter).connect(gain);
+      src.start(0, Math.random());
     }
+
     let stopped = false;
-    return {
+    const handle: LoopHandle = {
       setVolume: (v, smoothing = 0.3) => {
-        if (!stopped) gain.gain.setTargetAtTime(v, this.ctx.currentTime, smoothing);
+        if (!stopped && !this.disposed) gain.gain.setTargetAtTime(v, this.ctx.currentTime, smoothing);
       },
       setPosition: (p) => {
         if (!panner) return;
@@ -329,45 +506,31 @@ export class AudioManager {
       stop: (fade = 0.4) => {
         if (stopped) return;
         stopped = true;
-        gain.gain.setTargetAtTime(0, this.ctx.currentTime, fade / 3);
+        try {
+          gain.gain.setTargetAtTime(0, this.ctx.currentTime, Math.max(0.02, fade / 3));
+        } catch {
+          /* ctx closed */
+        }
         setTimeout(() => {
-          src?.stop();
+          try {
+            src?.stop();
+          } catch {
+            /* ignore */
+          }
           src?.disconnect();
+          extraFilter?.disconnect();
           gain.disconnect();
           panner?.disconnect();
-        }, fade * 1000 + 100);
+        }, fade * 1000 + 80);
       },
     };
+    this.activeLoops.push(handle);
+    return handle;
   }
 
-  /** In-world music source (the diner jukebox): muffled, positional, with record crackle. */
+  /** In-world diner jukebox: warm crackling record ambience (zero external media fetch aborts). */
   public createJukebox(position: THREE.Vector3): void {
-    const el = new Audio(MUSIC_DIR + MUSIC.jukebox.file);
-    el.loop = true;
-    el.crossOrigin = 'anonymous';
-    const lp = this.ctx.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.value = 2600;
-    const hp = this.ctx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 180;
-    const gain = this.ctx.createGain();
-    gain.gain.value = MUSIC.jukebox.gain * 0.9;
-    const panner = this.ctx.createPanner();
-    panner.panningModel = 'HRTF';
-    panner.distanceModel = 'inverse';
-    panner.refDistance = 3;
-    panner.rolloffFactor = 1.6;
-    panner.positionX.value = position.x;
-    panner.positionY.value = position.y;
-    panner.positionZ.value = position.z;
-    try {
-      this.ctx.createMediaElementSource(el).connect(hp).connect(lp).connect(gain).connect(panner).connect(this.sfxBus);
-    } catch {
-      return;
-    }
-    el.play().catch(() => {});
-    this.createLoop('loop_record', position, 0.25, 2.5);
+    this.createLoop('loop_record', position, 0.28, 3.0);
   }
 
   public setWeather(rain: number): void {
@@ -377,15 +540,69 @@ export class AudioManager {
   public playThunder(distance: number): void {
     const vol = THREE.MathUtils.clamp(1.2 - distance / 120, 0.25, 1);
     setTimeout(() => {
+      if (this.disposed) return;
       this.duck(0.32 * vol, 1.4);
       this.playUI('thunder', vol, 0.88 + Math.random() * 0.22, 0.65);
     }, (distance / 343) * 1000);
+  }
+
+  // ───────────────────────────── Captain Reyes Speech Synthesis Radio Comms ─────────────────────────────
+
+  public setVoiceEnabled(enabled: boolean): void {
+    this.voiceEnabled = enabled;
+    if (!enabled) this.stopSpeech();
+  }
+
+  public isVoiceEnabled(): boolean {
+    return this.voiceEnabled;
+  }
+
+  public stopSpeech(): void {
+    try {
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+    } catch {
+      /* speech API unavailable */
+    }
+  }
+
+  /** Speaks Captain Reyes's radio line via native Web Speech API with automatic soundtrack ducking & roger beep. */
+  public speakRadio(text: string): void {
+    if (this.muted || !this.voiceEnabled || this.disposed) return;
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    try {
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(text.replace(/^\.\.\./, ''));
+      utter.rate = 1.04;
+      utter.pitch = 0.88;
+      utter.volume = THREE.MathUtils.clamp(this.masterVolume * this.busVolumes.sfx * 0.85, 0, 1);
+      const voices = window.speechSynthesis.getVoices();
+      const preferred =
+        voices.find((v) => /en[-_]US/i.test(v.lang) && /(David|Mark|Guy|Google US English|Alex)/i.test(v.name)) ??
+        voices.find((v) => /^en/i.test(v.lang));
+      if (preferred) utter.voice = preferred;
+
+      const estSec = Math.max(2.2, text.length * 0.062);
+      this.duck(0.55, estSec);
+      utter.onend = () => {
+        if (!this.disposed && !this.muted) {
+          // Crisp radio roger-beep at end of transmission
+          this.envTone('sine', 1320, 1320, 0.055, 0.05);
+          this.envTone('sine', 980, 980, 0.065, 0.045, 0.065);
+        }
+      };
+      window.speechSynthesis.speak(utter);
+    } catch {
+      /* ignore speech synthesis errors */
+    }
   }
 
   // ───────────────────────────── Settings ─────────────────────────────
 
   public setMuted(muted: boolean): void {
     this.muted = muted;
+    if (muted) this.stopSpeech();
     this.applyMasterVolume();
   }
 
@@ -412,6 +629,7 @@ export class AudioManager {
   }
 
   private applyMasterVolume(): void {
+    if (this.disposed) return;
     this.listener.gain.gain.setTargetAtTime(this.muted ? 0 : this.masterVolume, this.ctx.currentTime, 0.05);
   }
 
@@ -426,6 +644,7 @@ export class AudioManager {
   // ───────────────────────────── Per-frame ─────────────────────────────
 
   public update(dt: number, isNight = false, listenerPos?: THREE.Vector3): void {
+    if (this.disposed) return;
     const now = this.ctx.currentTime;
     if (listenerPos) this.listenerPos.copy(listenerPos);
 
@@ -435,36 +654,20 @@ export class AudioManager {
     } else if (this.duckAmount > 0.001) {
       this.duckAmount = Math.max(0, this.duckAmount - dt * 0.85);
     }
-    this.musicDuck.gain.setTargetAtTime(1 - this.duckAmount * 0.65, now, 0.12);
+    this.musicDuck.gain.setTargetAtTime(1 - this.duckAmount * 0.68, now, 0.12);
     this.ambienceDuck.gain.setTargetAtTime(1 - this.duckAmount * 0.45, now, 0.12);
 
-    // Interior acoustic adaptation (muffles exterior rain/wind + tightens street echo)
+    // Interior acoustic adaptation
     this.indoorsAmount = THREE.MathUtils.lerp(this.indoorsAmount, this.indoorsTarget, Math.min(1, dt * 4.5));
     const indoorCutoff = 18000 * Math.pow(1300 / 18000, this.indoorsAmount);
     this.indoorFilter.frequency.setTargetAtTime(indoorCutoff, now, 0.08);
-    this.reverbBus.gain.setTargetAtTime(THREE.MathUtils.lerp(0.55, 0.16, this.indoorsAmount), now, 0.1);
+    this.reverbBus.gain.setTargetAtTime(THREE.MathUtils.lerp(0.52, 0.16, this.indoorsAmount), now, 0.1);
 
-    // Music mix
+    // Adaptive procedural soundtrack step
     this.combatAmount += (this.combatTarget - this.combatAmount) * Math.min(1, dt * (this.combatTarget > this.combatAmount ? 1.5 : 0.35));
-    const w = this.musicWeights;
-    if (this.gameMusicStarted) {
-      w.title = 0;
-      if (this.siege) {
-        w.siege = 1;
-        w.day = w.night = w.combat = 0;
-      } else {
-        const base = 1 - 0.65 * this.combatAmount;
-        w.day = (1 - this.nightAmount) * base;
-        w.night = this.nightAmount * base;
-        w.combat = this.combatAmount;
-        w.siege = 0;
-      }
-    }
-    for (const [layer, track] of this.music) {
-      track.gain.gain.setTargetAtTime(w[layer] * track.base, now, layer === 'combat' ? 0.4 : 1.2);
-    }
+    this.stepProceduralMusic(dt);
 
-    // Ambience beds (dampened softly when sheltered indoors)
+    // Ambience beds
     const r = this.rainAmount;
     const extMul = 1 - this.indoorsAmount * 0.42;
     this.wind?.setVolume((0.14 + 0.1 * this.nightAmount + 0.12 * r) * 0.9 * extMul, 1.5);
@@ -475,7 +678,7 @@ export class AudioManager {
     this.muffleAmount = THREE.MathUtils.lerp(this.muffleAmount, this.muffleTarget, Math.min(1, dt * 4));
     this.muffle.frequency.setTargetAtTime(20000 * Math.pow(700 / 20000, this.muffleAmount), now, 0.05);
 
-    // Sampled heartbeat at low health
+    // Low-health heartbeat
     if (this.heartbeatIntensity > 0.01) {
       this.heartbeatTimer -= dt;
       if (this.heartbeatTimer <= 0) {
@@ -486,7 +689,7 @@ export class AudioManager {
       this.heartbeatTimer = 0;
     }
 
-    // Distant life (and death) of the city
+    // Distant city life/death cues
     if (this.gameMusicStarted) {
       this.ambientEventTimer -= dt;
       if (this.ambientEventTimer <= 0) {
@@ -516,7 +719,7 @@ export class AudioManager {
     this.playPositional(key, pos, vol, 0.08, 18, 0.8, rate);
   }
 
-  // ───────────────────────────── One-shots (No-Repeat + Pitch/Gain Randomization) ─────────────────────────────
+  // ───────────────────────────── One-shots + Procedural Fallbacks ─────────────────────────────
 
   private resolve(key: string): string {
     const v = VARIANTS[key];
@@ -528,6 +731,34 @@ export class AudioManager {
     return v[pick];
   }
 
+  /** Synthesises a punchy procedural Web Audio fallback if an external buffer isn't loaded. */
+  private playProceduralFallback(key: string, volume: number, rate: number, dest: AudioNode): void {
+    const t = this.ctx.currentTime;
+    const v = volume * 0.45;
+    if (key.startsWith('gun_') || key.startsWith('explosion')) {
+      const dur = key.startsWith('explosion') ? 0.55 : key.includes('shotgun') || key.includes('sniper') ? 0.24 : 0.13;
+      const src = this.ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      const flt = this.ctx.createBiquadFilter();
+      flt.type = 'lowpass';
+      flt.frequency.setValueAtTime(key.startsWith('explosion') ? 850 : 2800 * rate, t);
+      flt.frequency.exponentialRampToValueAtTime(140, t + dur);
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(v, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      src.connect(flt).connect(g).connect(dest);
+      src.start(t, Math.random());
+      src.stop(t + dur + 0.02);
+      src.onended = () => {
+        src.disconnect();
+        flt.disconnect();
+        g.disconnect();
+      };
+      return;
+    }
+    this.envTone('triangle', 480 * rate, 180 * rate, 0.09, v * 0.6);
+  }
+
   private playBuffer(
     key: string,
     volume: number,
@@ -536,15 +767,17 @@ export class AudioManager {
     reverb: number,
     extraNodes: AudioNode[] = []
   ): void {
-    if (this.muted || this.activeOneShots >= MAX_CONCURRENT_ONESHOTS) return;
+    if (this.muted || this.disposed || this.activeOneShots >= MAX_CONCURRENT_ONESHOTS) return;
     const buf = this.assets.getAudioBuffer(this.resolve(key));
-    if (!buf) return;
+    if (!buf) {
+      this.playProceduralFallback(key, volume, rate, dest);
+      return;
+    }
     this.activeOneShots++;
     const src = this.ctx.createBufferSource();
     src.buffer = buf;
     src.playbackRate.value = Math.max(0.25, rate);
     const gain = this.ctx.createGain();
-    // Subtle ±7% volume micro-variation eliminates mechanical uniformity
     gain.gain.value = volume * (0.93 + Math.random() * 0.14);
     src.connect(gain).connect(dest);
 
@@ -565,13 +798,11 @@ export class AudioManager {
     src.start();
   }
 
-  /** Non-positional SFX / UI feedback with subtle anti-repetition pitch randomization (±6–10%). */
   public playUI(key: string, volume = 0.45, rate = 1, reverb = 0, pitchJitter = 0.08): void {
     const jitter = pitchJitter > 0 ? 1 + (Math.random() * 2 - 1) * pitchJitter : 1;
     this.playBuffer(key, volume, rate * jitter, this.sfxBus, reverb);
   }
 
-  /** Spatialized 3D HRTF one-shot with pitch randomization (±8–12%) and distance-based air absorption. */
   public playPositional(
     key: string,
     position: THREE.Vector3,
@@ -581,7 +812,7 @@ export class AudioManager {
     reverb = 0,
     rate = 1
   ): void {
-    if (this.muted || this.activeOneShots >= MAX_CONCURRENT_ONESHOTS) return;
+    if (this.muted || this.disposed || this.activeOneShots >= MAX_CONCURRENT_ONESHOTS) return;
     const dist = this.listenerPos.distanceTo(position);
     if (dist > 95) return;
 
@@ -598,7 +829,6 @@ export class AudioManager {
     const extras: AudioNode[] = [];
     let entry: AudioNode = panner;
 
-    // Air absorption: distant outdoor sounds lose high frequencies naturally
     if (dist > 16) {
       const airLP = this.ctx.createBiquadFilter();
       airLP.type = 'lowpass';
@@ -621,10 +851,23 @@ export class AudioManager {
     this.playUI(key, vol, heavy ? 0.86 : 0.98, 0.05, 0.11);
   }
 
-  // ───────────────────────────── Synthesised tactile cues ─────────────────────────────
+  /** Visceral rising snarl / telegraph cue when a zombie winds up an attack. */
+  public playZombieTelegraph(position: THREE.Vector3, isHeavy: boolean): void {
+    if (this.muted || this.disposed) return;
+    this.playPositional(isHeavy ? 'brute_roar' : 'zombie_aggro', position, isHeavy ? 0.72 : 0.48, 0.1, 10, 0.25, isHeavy ? 0.82 : 1.15);
+  }
+
+  /** Heavy ground slam sub-bass thump for Brute / The Butcher shockwaves. */
+  public playSlamImpact(position: THREE.Vector3): void {
+    if (this.muted || this.disposed) return;
+    this.playPositional('explosion_low', position, 0.85, 0.08, 12, 0.5, 0.75);
+    this.envTone('sine', 95, 32, 0.26, 0.24);
+  }
+
+  // ───────────────────────────── Synthesised Tactile Cues ─────────────────────────────
 
   private envTone(type: OscillatorType, f0: number, f1: number, dur: number, vol: number, delay = 0): void {
-    if (this.muted) return;
+    if (this.muted || this.disposed) return;
     const t = this.ctx.currentTime + delay;
     const osc = this.ctx.createOscillator();
     osc.type = type;
@@ -643,9 +886,8 @@ export class AudioManager {
     };
   }
 
-  /** Crisp cloth/air whoosh for tactical dodge dash. */
   public playDodge(): void {
-    if (this.muted) return;
+    if (this.muted || this.disposed) return;
     const t = this.ctx.currentTime;
     const src = this.ctx.createBufferSource();
     src.buffer = this.noiseBuffer;
@@ -670,10 +912,9 @@ export class AudioManager {
     this.playUI('gear_rustle', 0.32, 1.15, 0, 0.1);
   }
 
-  /** The "Blood Siren": a distant air-raid siren that wails at nightfall. */
   public playSiren(): void {
-    if (this.muted) return;
-    this.duck(0.45, 5.5);
+    if (this.muted || this.disposed) return;
+    this.duck(0.48, 5.5);
     const t0 = this.ctx.currentTime + 0.05;
     const dur = 7.5;
     const out = this.ctx.createGain();
@@ -724,10 +965,9 @@ export class AudioManager {
     }
   }
 
-  /** Squelch + crackle that opens each radio transmission and ducks the soundtrack. */
   public playRadioStatic(): void {
-    if (this.muted) return;
-    this.duck(0.38, 3.2);
+    if (this.muted || this.disposed) return;
+    this.duck(0.45, 3.2);
     const t = this.ctx.currentTime;
     const src = this.ctx.createBufferSource();
     src.buffer = this.noiseBuffer;

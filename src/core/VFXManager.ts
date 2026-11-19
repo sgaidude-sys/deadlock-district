@@ -33,6 +33,15 @@ interface SlashArc {
   active: boolean;
 }
 
+interface TelegraphRing {
+  mesh: THREE.Mesh;
+  mat: THREE.MeshBasicMaterial;
+  age: number;
+  lifetime: number;
+  maxRadius: number;
+  active: boolean;
+}
+
 interface ShellCasing {
   mesh: THREE.Mesh;
   velocity: THREE.Vector3;
@@ -65,6 +74,7 @@ export interface ObjectiveMarker {
 const PARTICLE_POOL_SIZE = 320;
 const TRACER_POOL_SIZE = 32;
 const SLASH_POOL_SIZE = 4;
+const RING_POOL_SIZE = 6;
 const FOG_WISP_COUNT = 22;
 const ASH_COUNT = 700;
 const ASH_RANGE = 46;
@@ -82,6 +92,8 @@ export class VFXManager {
   private tracerCursor = 0;
   private slashPool: SlashArc[] = [];
   private slashCursor = 0;
+  private ringPool: TelegraphRing[] = [];
+  private ringCursor = 0;
 
   private casings: ShellCasing[] = [];
   private fireEmitters: FireEmitter[] = [];
@@ -120,6 +132,7 @@ export class VFXManager {
 
   private tracerGeo = new THREE.CylinderGeometry(1, 1, 1, 5, 1, true).rotateX(Math.PI / 2);
   private slashGeo = new THREE.RingGeometry(0.55, 1.35, 18, 1, -Math.PI * 0.42, Math.PI * 0.84).rotateX(-Math.PI / 2);
+  private ringGeo = new THREE.RingGeometry(0.84, 1.0, 28).rotateX(-Math.PI / 2);
   private casingGeo = new THREE.CylinderGeometry(0.012, 0.012, 0.045, 6);
   private casingMat = new THREE.MeshStandardMaterial({
     color: 0xe3b354,
@@ -222,6 +235,23 @@ export class VFXManager {
       mesh.visible = false;
       this.scene.add(mesh);
       this.slashPool.push({ mesh, mat, age: 0, lifetime: 0.16, active: false });
+    }
+
+    // Pre-allocate ground attack telegraph warning ring pool
+    for (let i = 0; i < RING_POOL_SIZE; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xef4444,
+        transparent: true,
+        opacity: 0.75,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(this.ringGeo, mat);
+      mesh.visible = false;
+      mesh.renderOrder = 3;
+      this.scene.add(mesh);
+      this.ringPool.push({ mesh, mat, age: 0, lifetime: 0.7, maxRadius: 3.0, active: false });
     }
 
     // Drifting low-lying ground fog wisps for nocturnal & stormy depth
@@ -666,6 +696,52 @@ export class VFXManager {
     }
   }
 
+  /** Expanding crimson telegraph warning ring during Brute / Boss heavy slam windup. */
+  public spawnWarningRing(pos: THREE.Vector3, radius: number, duration: number): void {
+    const r = this.ringPool[this.ringCursor];
+    this.ringCursor = (this.ringCursor + 1) % RING_POOL_SIZE;
+    r.active = true;
+    r.age = 0;
+    r.lifetime = duration;
+    r.maxRadius = radius;
+    r.mesh.position.set(pos.x, 0.11, pos.z);
+    r.mesh.scale.setScalar(0.25);
+    r.mat.opacity = 0.75;
+    r.mesh.visible = true;
+  }
+
+  /** Heavy ground slam dust & ember ring when a Brute / Butcher completes its strike. */
+  public spawnSlamShockwave(pos: THREE.Vector3, radius: number): void {
+    const center = pos.clone().setY(0.25);
+    this.emit(this.tex('vfx_circle_05'), 0xfca5a5, center, new THREE.Vector3(), 0.5, radius * 2.1, 0.28, 0.72, true);
+    for (let i = 0; i < 12; i++) {
+      const a = (i / 12) * Math.PI * 2;
+      const vel = new THREE.Vector3(Math.cos(a) * (3.2 + Math.random() * 2), 1.0 + Math.random() * 1.2, Math.sin(a) * (3.2 + Math.random() * 2));
+      this.emit(this.tex('vfx_smoke_01', 'vfx_dirt_01'), 0x8f8880, center, vel, 0.35, 1.15, 0.55, 0.45, false, 3.5, 2.0);
+    }
+  }
+
+  /** Rising dark ash & glowing ember motes as a defeated zombie disintegrates smoothly. */
+  public spawnDissolveEmbers(pos: THREE.Vector3): void {
+    for (let i = 0; i < 3; i++) {
+      const p = new THREE.Vector3(pos.x + (Math.random() - 0.5) * 0.9, 0.15 + Math.random() * 0.35, pos.z + (Math.random() - 0.5) * 0.9);
+      const isEmber = Math.random() < 0.45;
+      this.emit(
+        isEmber ? this.tex('vfx_spark_01') : this.tex('vfx_smoke_01'),
+        isEmber ? 0xf97316 : 0x27272a,
+        p,
+        new THREE.Vector3((Math.random() - 0.5) * 0.5, 1.1 + Math.random() * 1.1, (Math.random() - 0.5) * 0.5),
+        isEmber ? 0.12 : 0.3,
+        isEmber ? 0.02 : 0.75,
+        0.75 + Math.random() * 0.35,
+        isEmber ? 0.9 : 0.35,
+        isEmber,
+        -0.3,
+        0.8
+      );
+    }
+  }
+
   public spawnTracer(start: THREE.Vector3, end: THREE.Vector3): void {
     const dist = start.distanceTo(end);
     if (dist < 0.3) return;
@@ -1097,6 +1173,21 @@ export class VFXManager {
         arc.mesh.rotation.y += dt * 11;
         arc.mesh.scale.setScalar(0.85 + t * 0.55);
         arc.mat.opacity = 0.72 * (1 - t);
+      }
+    }
+
+    // Update attack telegraph warning rings
+    for (let i = 0; i < RING_POOL_SIZE; i++) {
+      const r = this.ringPool[i];
+      if (!r.active) continue;
+      r.age += dt;
+      if (r.age >= r.lifetime) {
+        r.active = false;
+        r.mesh.visible = false;
+      } else {
+        const t = r.age / r.lifetime;
+        r.mesh.scale.setScalar(THREE.MathUtils.lerp(0.35, r.maxRadius, t));
+        r.mat.opacity = 0.35 + 0.55 * Math.sin(t * Math.PI);
       }
     }
 

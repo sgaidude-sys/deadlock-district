@@ -232,9 +232,14 @@ export class AssetManager {
   private skinned = new Set<string>();
   private clips = new Map<string, THREE.AnimationClip[]>();
   private audioBuffers = new Map<string, AudioBuffer>();
+  public isLoaded = false;
 
   public async preloadAll(onProgress?: (loaded: number, total: number, currentLabel: string) => void): Promise<void> {
     const total = ASSET_MANIFEST.length;
+    if (this.isLoaded) {
+      onProgress?.(total, total, 'ready');
+      return;
+    }
     let loaded = 0;
 
     const loadOne = async (entry: AssetEntry) => {
@@ -262,6 +267,7 @@ export class AssetManager {
     for (let i = 0; i < ASSET_MANIFEST.length; i += batchSize) {
       await Promise.all(ASSET_MANIFEST.slice(i, i + batchSize).map(loadOne));
     }
+    this.isLoaded = true;
   }
 
   private registerModel(entry: AssetEntry, root: THREE.Object3D, animations: THREE.AnimationClip[]): void {

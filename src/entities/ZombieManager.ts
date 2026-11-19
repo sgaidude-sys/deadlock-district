@@ -25,7 +25,12 @@ export interface ZombieInstance {
   damage: number;
   attackCooldown: number;
   attackWindup: number;
+  attackPhase: 'none' | 'windup' | 'strike' | 'recover';
+  attackPhaseTimer: number;
+  flinchPitch: number;
+  flinchRoll: number;
   hitFlashTimer: number;
+  dissolveEmitTimer: number;
   staggerTimer: number;
   pinTimer: number;
   groanTimer: number;
@@ -305,7 +310,12 @@ export class ZombieManager {
       damage,
       attackCooldown: 0,
       attackWindup: 0,
+      attackPhase: 'none',
+      attackPhaseTimer: 0,
+      flinchPitch: 0,
+      flinchRoll: 0,
       hitFlashTimer: 0,
+      dissolveEmitTimer: 0,
       staggerTimer: 0,
       pinTimer: 0,
       groanTimer: 2 + Math.random() * 6,
@@ -396,13 +406,25 @@ export class ZombieManager {
   ): ZombieHitResult {
     const dmg = headshot ? damage * 2.2 : damage;
     z.hp -= dmg;
-    z.hitFlashTimer = 0.09;
-    z.staggerTimer = Math.max(z.staggerTimer, z.archetype === 'brute' ? 0.08 : headshot ? 0.32 : 0.18);
-    z.attackWindup = 0;
+    z.hitFlashTimer = 0.13;
+    z.staggerTimer = Math.max(z.staggerTimer, z.archetype === 'brute' ? 0.08 : headshot ? 0.34 : 0.19);
+    // Interrupt normal windup on stagger (Brutes have hyper-armor once slamming!)
+    if (z.archetype !== 'brute' && z.attackPhase === 'windup') {
+      z.attackPhase = 'none';
+      z.attackPhaseTimer = 0;
+    }
     if (z.state !== 'attack') z.state = 'chase';
-    this.setEmissive(z, 0xff2a2a, 1.4);
+    // Crisp bright white-hot impact flash (shifts to crimson as it decays)
+    this.setEmissive(z, 0xffffff, 2.6);
 
-    const knock = (z.archetype === 'brute' ? 2.5 : 6.0) * Math.min(1.6, dmg / 30);
+    // Directional hit flinch proportional to impact force
+    const localForward = new THREE.Vector3(Math.sin(z.facing), 0, Math.cos(z.facing));
+    const localRight = new THREE.Vector3(Math.cos(z.facing), 0, -Math.sin(z.facing));
+    const flinchScale = (z.archetype === 'brute' ? 0.14 : 0.34) * Math.min(1.5, dmg / 30);
+    z.flinchPitch = THREE.MathUtils.clamp(z.flinchPitch - impulseDir.dot(localForward) * flinchScale, -0.45, 0.45);
+    z.flinchRoll = THREE.MathUtils.clamp(z.flinchRoll + impulseDir.dot(localRight) * flinchScale, -0.4, 0.4);
+
+    const knock = (z.archetype === 'brute' ? 2.5 : 6.2) * Math.min(1.6, dmg / 30);
     z.body.velocity.x += impulseDir.x * knock;
     z.body.velocity.z += impulseDir.z * knock;
 
@@ -589,10 +611,31 @@ export class ZombieManager {
       const z = this.zombies[i];
 
       if (z.state === 'dead') {
-        // Kit Death clip plays once and holds; corpse sinks away at the end
+        // Collapse plays once and holds, then smoothly disintegrates into glowing embers & ash
         z.deathTimer -= dt;
-        if (z.mixer && z.deathTimer > 4) z.mixer.update(dt);
-        if (z.deathTimer < 1.2) z.group.position.y -= dt * 0.3;
+        if (z.mixer && z.deathTimer > 3.6) z.mixer.update(dt);
+        if (z.deathTimer < 1.8) {
+          const alpha = THREE.MathUtils.clamp(z.deathTimer / 1.8, 0, 1);
+          z.dissolveEmitTimer -= dt;
+          if (z.dissolveEmitTimer <= 0) {
+            z.dissolveEmitTimer = 0.14;
+            this.vfx.spawnDissolveEmbers(z.group.position);
+          }
+          for (const m of z.meshes) {
+            const mats = Array.isArray(m.material) ? m.material : [m.material];
+            for (const mat of mats) {
+              if (mat instanceof THREE.MeshStandardMaterial) {
+                if (!mat.transparent) {
+                  mat.transparent = true;
+                  mat.needsUpdate = true;
+                }
+                mat.opacity = alpha;
+                mat.emissive.setHex(0xc2410c);
+                mat.emissiveIntensity = (1 - alpha) * 1.1;
+              }
+            }
+          }
+        }
         if (z.deathTimer <= 0) {
           this.disposeZombie(z);
           this.zombies.splice(i, 1);
@@ -602,9 +645,18 @@ export class ZombieManager {
 
       if (z.mixer) z.mixer.update(dt);
 
+      // Decay directional hit flinch smoothly
+      z.flinchPitch = THREE.MathUtils.lerp(z.flinchPitch, 0, Math.min(1, dt * 11));
+      z.flinchRoll = THREE.MathUtils.lerp(z.flinchRoll, 0, Math.min(1, dt * 11));
+
       if (z.hitFlashTimer > 0) {
         z.hitFlashTimer -= dt;
-        if (z.hitFlashTimer <= 0) this.setEmissive(z, 0x000000, 0);
+        if (z.hitFlashTimer <= 0) {
+          this.setEmissive(z, 0x000000, 0);
+        } else if (z.hitFlashTimer < 0.07) {
+          // Transition from crisp white impact flash to deep crimson
+          this.setEmissive(z, 0xdc2626, (z.hitFlashTimer / 0.07) * 1.3);
+        }
       }
 
       z.attackCooldown = Math.max(0, z.attackCooldown - dt);
@@ -629,11 +681,21 @@ export class ZombieManager {
         continue;
       }
 
-      // Throttled line-of-sight checks
+      // Throttled line-of-sight + directional 150-degree vision cone checks (enables sneaking behind zombies!)
       z.sightTimer -= dt;
       if (z.sightTimer <= 0) {
         z.sightTimer = 0.25 + Math.random() * 0.1;
-        z.canSeePlayer = distToPlayer < 4 || (distToPlayer < visionRange && this.hasLineOfSight(zPos, playerPos));
+        const proxSense = playerCrouching ? 2.1 : 3.8;
+        if (distToPlayer < proxSense) {
+          z.canSeePlayer = true;
+        } else if (distToPlayer < visionRange) {
+          const toP = playerPos.clone().sub(zPos).setY(0).normalize();
+          const zFwd = new THREE.Vector3(Math.sin(z.facing), 0, Math.cos(z.facing));
+          const inCone = z.state === 'chase' || z.state === 'attack' || zFwd.dot(toP) > 0.22;
+          z.canSeePlayer = inCone && this.hasLineOfSight(zPos, playerPos);
+        } else {
+          z.canSeePlayer = false;
+        }
         if (z.canSeePlayer) z.lastKnownPlayer = playerPos.clone();
       }
 
@@ -659,9 +721,17 @@ export class ZombieManager {
       if (z.state === 'chase') {
         targetPos = playerPos;
         moveSpeed = z.speed * (isNight ? 1.15 : 1.0);
-        if (distToPlayer < 1.5 + z.radius) {
+        const startAttackRange = z.archetype === 'brute' ? 2.1 + z.radius : 1.55 + z.radius;
+        if (distToPlayer < startAttackRange && z.attackCooldown <= 0) {
           z.state = 'attack';
-          z.attackWindup = 0.45; // telegraph before the first bite
+          z.attackPhase = 'windup';
+          const isBoss = z.id === this.bossId;
+          const isHeavy = z.archetype === 'brute';
+          z.attackPhaseTimer = isBoss ? 0.85 : isHeavy ? 0.72 : z.archetype === 'sprinter' ? 0.36 : 0.5;
+          this.audio.playZombieTelegraph(zPos, isHeavy);
+          if (isHeavy) {
+            this.vfx.spawnWarningRing(zPos, isBoss ? 3.5 : 2.8, z.attackPhaseTimer);
+          }
         }
       } else if (z.state === 'investigate' && z.investigateTarget) {
         targetPos = z.investigateTarget;
@@ -675,19 +745,62 @@ export class ZombieManager {
         z.patrolTarget = this.randomPatrolNear(zPos);
       }
 
+      // 3-Phase Telegraphed Attack State Machine: Anticipation (windup) -> Execution (strike) -> Recovery (recover)
       if (z.state === 'attack') {
-        z.body.velocity.x *= 0.6;
-        z.body.velocity.z *= 0.6;
-        const toP = playerPos.clone().sub(zPos);
-        this.turnToward(z, Math.atan2(toP.x, toP.z), dt, 10);
-        this.playZombieAnim(z, 'attack', 1.15);
-        if (z.attackWindup > 0) {
-          z.attackWindup -= dt;
-        } else if (z.attackCooldown <= 0 && distToPlayer < 1.9 + z.radius) {
-          z.attackCooldown = z.archetype === 'sprinter' ? 0.9 : 1.2;
-          onPlayerHit(z.damage, zPos);
+        const isBoss = z.id === this.bossId;
+        const isHeavy = z.archetype === 'brute';
+        const toP = playerPos.clone().sub(zPos).setY(0);
+        const toDir = toP.lengthSq() > 0.001 ? toP.clone().normalize() : new THREE.Vector3(Math.sin(z.facing), 0, Math.cos(z.facing));
+        z.attackPhaseTimer -= dt;
+
+        if (z.attackPhase === 'windup') {
+          z.body.velocity.x *= 0.65;
+          z.body.velocity.z *= 0.65;
+          this.turnToward(z, Math.atan2(toDir.x, toDir.z), dt, 10);
+          // Lean back visibly during anticipation and pulse amber/crimson warning glint
+          z.flinchPitch = THREE.MathUtils.lerp(z.flinchPitch, isHeavy ? -0.32 : -0.22, Math.min(1, dt * 10));
+          this.playZombieAnim(z, 'idle', 0.8);
+          if (z.hitFlashTimer <= 0) {
+            const pulse = 0.5 + 0.5 * Math.sin(z.attackPhaseTimer * 28);
+            this.setEmissive(z, isHeavy ? 0xef4444 : 0xf59e0b, 0.35 + pulse * 0.65);
+          }
+          if (z.attackPhaseTimer <= 0) {
+            // Transition -> Energetic Strike Execution
+            z.attackPhase = 'strike';
+            z.attackPhaseTimer = 0.16;
+            if (z.hitFlashTimer <= 0) this.setEmissive(z, 0x000000, 0);
+            const lunge = isHeavy ? 3.5 : z.archetype === 'sprinter' ? 7.8 : 5.2;
+            z.body.velocity.x = toDir.x * lunge;
+            z.body.velocity.z = toDir.z * lunge;
+            z.flinchPitch = isHeavy ? 0.36 : 0.28;
+            this.playZombieAnim(z, 'attack', isHeavy ? 1.05 : 1.3, true);
+
+            const hitRange = isBoss ? 3.5 : isHeavy ? 2.8 : 2.1 + z.radius;
+            if (isHeavy) {
+              this.vfx.spawnSlamShockwave(zPos, hitRange);
+              this.audio.playSlamImpact(zPos);
+            }
+            if (distToPlayer < hitRange) {
+              onPlayerHit(z.damage, zPos);
+            }
+          }
+        } else if (z.attackPhase === 'strike') {
+          z.body.velocity.x *= 0.82;
+          z.body.velocity.z *= 0.82;
+          if (z.attackPhaseTimer <= 0) {
+            z.attackPhase = 'recover';
+            z.attackPhaseTimer = isHeavy ? 0.72 : z.archetype === 'sprinter' ? 0.38 : 0.48;
+            z.attackCooldown = isHeavy ? 1.15 : z.archetype === 'sprinter' ? 0.65 : 0.85;
+          }
+        } else {
+          // Recovery window: vulnerable follow-through
+          z.body.velocity.x *= 0.6;
+          z.body.velocity.z *= 0.6;
+          if (z.attackPhaseTimer <= 0) {
+            z.attackPhase = 'none';
+            z.state = 'chase';
+          }
         }
-        if (distToPlayer >= 2.2 + z.radius) z.state = 'chase';
         this.syncTransform(z, dt);
         continue;
       }
@@ -800,6 +913,6 @@ export class ZombieManager {
     z.body.position.y = z.radius;
     z.body.velocity.y = 0;
     z.group.position.set(z.body.interpolatedPosition.x, 0.06, z.body.interpolatedPosition.z);
-    z.group.rotation.set(0, z.facing, 0);
+    z.group.rotation.set(z.flinchPitch, z.facing, z.flinchRoll, 'YXZ');
   }
 }

@@ -83,6 +83,7 @@ export class PlayerController {
   private dodgeDir = new THREE.Vector3();
   private fovKick = 0;
   private camRoll = 0;
+  private meleeLean = 0;
   private wetness = 0;
   private onHeavyShot?: (strength: number) => void;
 
@@ -474,26 +475,24 @@ export class PlayerController {
       this.pitch -= rec * 0.6;
     }
 
-    // ── Free orbit camera: mouse (or arrow keys) moves the camera, not the body ──
-    if (!inventoryOpen && this.input.isPointerLocked) {
+    // ── Free orbit camera: mouse (locked or RMB drag / touch) or arrow keys ──
+    if (!inventoryOpen) {
       const { dx, dy } = this.input.consumeMouseDelta();
       const adsScale = this.isAiming ? 0.6 : 1;
       this.yaw -= dx * adsScale;
       this.pitch = THREE.MathUtils.clamp(this.pitch - dy * adsScale, PITCH_MIN, PITCH_MAX);
-    } else {
-      this.input.consumeMouseDelta();
-    }
-    if (!inventoryOpen) {
       const keyLook = 2.2 * dt;
       if (this.input.isDown('ArrowLeft')) this.yaw += keyLook;
       if (this.input.isDown('ArrowRight')) this.yaw -= keyLook;
       if (this.input.isDown('ArrowUp')) this.pitch = Math.min(PITCH_MAX, this.pitch + keyLook * 0.7);
       if (this.input.isDown('ArrowDown')) this.pitch = Math.max(PITCH_MIN, this.pitch - keyLook * 0.7);
+    } else {
+      this.input.consumeMouseDelta();
     }
 
-    this.isAiming = !inventoryOpen && this.input.rightMouseDown && !this.equippedWeapon.isMelee;
+    this.isAiming = !inventoryOpen && this.input.isAimHeld() && !this.equippedWeapon.isMelee;
 
-    // ── Movement is relative to the camera ──
+    // ── Movement is relative to the camera (WASD + Touch Virtual Stick) ──
     const camFwd = this.camForward();
     const camRight = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
     const moveDir = new THREE.Vector3();
@@ -502,6 +501,8 @@ export class PlayerController {
       if (this.input.isDown('KeyS')) moveDir.sub(camFwd);
       if (this.input.isDown('KeyD')) moveDir.add(camRight);
       if (this.input.isDown('KeyA')) moveDir.sub(camRight);
+      if (Math.abs(this.input.touchMoveY) > 0.05) moveDir.addScaledVector(camFwd, -this.input.touchMoveY);
+      if (Math.abs(this.input.touchMoveX) > 0.05) moveDir.addScaledVector(camRight, this.input.touchMoveX);
     }
     const isMoving = moveDir.lengthSq() > 0.001;
     if (isMoving) moveDir.normalize();
@@ -600,7 +601,8 @@ export class PlayerController {
     const pitchTarget = (this.locoMode === 'run' ? 0.07 : 0.02) * speedK * (this.isSprinting ? 1.4 : 1);
     this.lean.x += (pitchTarget - this.lean.x) * Math.min(1, dt * 6);
     this.lean.y += (rollTarget - this.lean.y) * Math.min(1, dt * 6);
-    this.modelGroup.rotation.set(this.lean.x, 0, this.lean.y);
+    this.meleeLean = THREE.MathUtils.lerp(this.meleeLean, 0, Math.min(1, dt * 10));
+    this.modelGroup.rotation.set(this.lean.x + this.meleeLean, 0, this.lean.y);
 
     this.body.position.y = BODY_RADIUS;
     this.body.velocity.y = 0;
@@ -615,12 +617,15 @@ export class PlayerController {
     if (this.pendingMelee >= 0) {
       this.pendingMelee -= dt;
       if (this.pendingMelee < 0) {
+        // Execution frame: snap forward + slash arc + hitbox sweep
+        this.meleeLean = 0.28;
+        this.vfx.spawnMeleeSlash(this.getPosition(), this.getForward());
         const hit = this.onMelee?.(this.getPosition(), this.getForward(), this.equippedWeapon) ?? false;
         if (!hit) this.audio.playUI('melee_swing', 0.25, 0.8);
       }
     }
 
-    if (!inventoryOpen && this.input.isPointerLocked && this.input.leftMouseDown) {
+    if (!inventoryOpen && this.input.isFireHeld()) {
       this.tryFire(raycastTargets, dt);
     }
 
@@ -685,11 +690,12 @@ export class PlayerController {
     this.audio.emitNoise(playerPos, w.noiseRadius);
 
     if (w.isMelee) {
+      // Telegraphed anticipation windup -> execution at 0.15s -> recovery
       this.facing = this.yaw;
-      this.playAnim('Slash', true, 0.5, 1.5);
+      this.meleeLean = -0.24;
+      this.playAnim('Slash', true, 0.52, 1.45);
       this.audio.playUI('melee_swing', 0.55, 0.9 + Math.random() * 0.15);
-      this.vfx.spawnMeleeSlash(playerPos, this.getForward());
-      this.pendingMelee = 0.16;
+      this.pendingMelee = 0.15;
       return;
     }
 

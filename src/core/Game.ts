@@ -103,11 +103,16 @@ export class Game {
   private fxaaPass: ShaderPass;
 
   private physicsWorld: CANNON.World;
-  private assets = new AssetManager();
+  private assets: AssetManager;
   private audio: AudioManager;
   private input: InputManager;
   private vfx: VFXManager;
   private hud: HUD;
+  private onRestart?: () => void;
+  private resizeObserver: ResizeObserver;
+  private rafId = 0;
+  private disposed = false;
+  private uiRoot: HTMLElement;
 
   private worldData!: CityWorldData;
   private player: PlayerController | null = null;
@@ -166,6 +171,7 @@ export class Game {
     ambienceVolume: 0.85,
     sensitivity: 1,
     muted: false,
+    voiceEnabled: true,
     highQuality: true,
   };
 
@@ -173,8 +179,11 @@ export class Game {
   private elapsed = 0;
   private titleLook = new THREE.Vector3(0, 2, 0);
 
-  constructor(container: HTMLElement, uiRoot: HTMLElement) {
+  constructor(container: HTMLElement, uiRoot: HTMLElement, assets = new AssetManager(), onRestart?: () => void) {
     this.container = container;
+    this.uiRoot = uiRoot;
+    this.assets = assets;
+    this.onRestart = onRestart;
 
     this.scene = new THREE.Scene();
     this.fog = new THREE.FogExp2(0x8a99a6, 0.0095);
@@ -274,8 +283,27 @@ export class Game {
         this.hud.setMuted(this.settings.muted);
         this.saveSettings();
       },
+      onToggleVoice: () => {
+        this.settings.voiceEnabled = !this.settings.voiceEnabled;
+        this.audio.setVoiceEnabled(this.settings.voiceEnabled);
+        this.hud.setVoiceEnabled(this.settings.voiceEnabled);
+        this.saveSettings();
+      },
       onResume: () => this.resume(),
-      onRestart: () => window.location.reload(),
+      onRestart: () => {
+        if (this.onRestart) this.onRestart();
+        else window.location.reload();
+      },
+      onTouchMove: (x, y) => {
+        this.input.touchMoveX = x;
+        this.input.touchMoveY = y;
+      },
+      onTouchFire: (down) => {
+        this.input.touchFireHeld = down;
+      },
+      onTouchAction: (code) => {
+        this.input.triggerKeyPress(code);
+      },
       onVolumeChange: (v) => {
         this.settings.volume = v;
         this.audio.setMasterVolume(v);
@@ -303,7 +331,7 @@ export class Game {
 
     // Interface sounds for every button in the HUD (delegated, so new buttons get them too)
     let lastHover = 0;
-    uiRoot.addEventListener('mouseover', (e) => {
+    this.handleUiMouseOver = (e: MouseEvent) => {
       const btn = (e.target as HTMLElement).closest('button');
       if (!btn || btn.contains(e.relatedTarget as Node)) return;
       const now = performance.now();
@@ -311,22 +339,47 @@ export class Game {
         lastHover = now;
         this.audio.playUI('ui_hover', 0.25);
       }
-    });
-    uiRoot.addEventListener('click', (e) => {
+    };
+    this.handleUiClick = (e: MouseEvent) => {
       if ((e.target as HTMLElement).closest('button')) this.audio.playUI('ui_click', 0.35);
-    });
+    };
+    uiRoot.addEventListener('mouseover', this.handleUiMouseOver);
+    uiRoot.addEventListener('click', this.handleUiClick);
 
     window.addEventListener('resize', this.handleResize);
-    new ResizeObserver(this.handleResize).observe(this.container);
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden && this.running && !this.gameOver) this.setPaused(true);
-    });
+    this.resizeObserver = new ResizeObserver(this.handleResize);
+    this.resizeObserver.observe(this.container);
+    document.addEventListener('visibilitychange', this.handleVisibilityChange);
     this.input.onPointerLockChange((locked) => {
       if (!locked && this.running && !this.inventoryOpen && !this.gameOver && this.input.hasEverLocked) {
         this.setPaused(true);
       }
     });
     this.bindHotkeys();
+  }
+
+  private handleUiMouseOver: (e: MouseEvent) => void;
+  private handleUiClick: (e: MouseEvent) => void;
+  private handleVisibilityChange = (): void => {
+    if (document.hidden && this.running && !this.gameOver) this.setPaused(true);
+  };
+
+  /** Cleanly tears down all loop timers, audio nodes, listeners and WebGL resources for instant replay. */
+  public dispose(): void {
+    this.disposed = true;
+    cancelAnimationFrame(this.rafId);
+    window.removeEventListener('resize', this.handleResize);
+    document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    this.uiRoot.removeEventListener('mouseover', this.handleUiMouseOver);
+    this.uiRoot.removeEventListener('click', this.handleUiClick);
+    this.resizeObserver.disconnect();
+    this.input.dispose();
+    this.audio.dispose();
+    this.composer.dispose();
+    this.renderer.dispose();
+    if (this.renderer.domElement.parentElement === this.container) {
+      this.container.removeChild(this.renderer.domElement);
+    }
   }
 
   private viewSize(): { w: number; h: number } {
@@ -347,6 +400,7 @@ export class Game {
     this.audio.setBusVolume('music', this.settings.musicVolume);
     this.audio.setBusVolume('sfx', this.settings.sfxVolume);
     this.audio.setBusVolume('ambience', this.settings.ambienceVolume);
+    this.audio.setVoiceEnabled(this.settings.voiceEnabled);
     this.audio.setMuted(this.settings.muted);
     this.input.sensitivity = 0.0022 * this.settings.sensitivity;
     this.applyQuality();
@@ -594,7 +648,10 @@ export class Game {
     this.paused = paused;
     this.hud.setPaused(paused);
     this.audio.setMuffle(paused ? 0.85 : 0);
-    if (paused) this.input.exitPointerLock();
+    if (paused) {
+      this.audio.stopSpeech();
+      this.input.exitPointerLock();
+    }
   }
 
   private resume(): void {
@@ -968,7 +1025,10 @@ export class Game {
         }
       },
     });
-    story.setOnRadioLine(() => this.audio.playRadioStatic());
+    story.setOnRadioLine((line) => {
+      this.audio.playRadioStatic();
+      this.audio.speakRadio(line.text);
+    });
     return story;
   }
 
@@ -1248,7 +1308,8 @@ export class Game {
   }
 
   private animate = (): void => {
-    requestAnimationFrame(this.animate);
+    if (this.disposed) return;
+    this.rafId = requestAnimationFrame(this.animate);
 
     const now = performance.now();
     const rawDt = Math.min(0.05, (now - this.lastTime) / 1000);

@@ -8,12 +8,17 @@ export interface HUDCallbacks {
   onCraftMedkit: () => void;
   onCraftAmmo: (type: 'pistol' | 'shells' | 'rifle') => void;
   onToggleMute: () => void;
+  onToggleVoice: () => void;
   onResume: () => void;
   onRestart: () => void;
   onVolumeChange: (v: number) => void;
   onBusVolumeChange: (bus: AudioBus, v: number) => void;
   onQualityChange: (high: boolean) => void;
   onSensitivityChange: (v: number) => void;
+  onTouchMove?: (x: number, y: number) => void;
+  onTouchLook?: (dx: number, dy: number) => void;
+  onTouchFire?: (down: boolean) => void;
+  onTouchAction?: (code: string) => void;
 }
 
 export interface HUDSettingsSnapshot {
@@ -23,6 +28,7 @@ export interface HUDSettingsSnapshot {
   ambienceVolume: number;
   sensitivity: number;
   muted: boolean;
+  voiceEnabled: boolean;
   highQuality: boolean;
 }
 
@@ -131,12 +137,12 @@ export class HUD {
             <div class="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[11px] text-zinc-300 bg-black/40 p-3.5 rounded-xl border border-white/5 font-mono">
               <div><span class="kbd">WASD</span> Move <span class="kbd">Shift</span> Sprint</div>
               <div><span class="kbd">Space</span> Dodge <span class="kbd">C</span> Crouch</div>
-              <div><span class="kbd">LMB</span> Fire <span class="kbd">RMB</span> Aim</div>
+              <div><span class="kbd">LMB</span>/<span class="kbd">J</span> Fire <span class="kbd">RMB</span>/<span class="kbd">K</span> Aim</div>
               <div><span class="kbd">E</span> Interact <span class="kbd">R</span> Reload</div>
               <div><span class="kbd">1-6</span>/<span class="kbd">Wheel</span> Weapons</div>
               <div><span class="kbd">Tab</span> Pack <span class="kbd">Q</span> Heal</div>
               <div><span class="kbd">F</span> Light <span class="kbd">V</span> Shoulder</div>
-              <div><span class="kbd">Mouse</span> Aim <span class="kbd">Esc</span> Pause</div>
+              <div><span class="kbd">Mouse</span>/<span class="kbd">Arrows</span> Look <span class="kbd">Esc</span> Pause</div>
             </div>
 
             <button id="btn-deploy" class="w-full py-3.5 rounded-xl bg-red-600 hover:bg-red-500 active:scale-[0.99] text-white font-bold tracking-[0.15em] uppercase transition shadow-lg shadow-red-900/50">
@@ -318,7 +324,22 @@ export class HUD {
         </div>
 
         <div id="pause-hint" class="hidden fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-1.5 rounded-full bg-zinc-900/90 border border-zinc-700 text-xs font-mono text-zinc-300 pointer-events-auto cursor-pointer">
-          Click to lock mouse & aim • Arrow keys also look around
+          Click to lock mouse • Arrows + J/K also aim &amp; fire
+        </div>
+
+        <!-- Touch Dual-Input Controls (shown automatically on touchscreens only) -->
+        <div id="touch-controls" class="hidden [@media(pointer:coarse)]:flex fixed inset-x-0 bottom-28 px-6 justify-between items-end pointer-events-none z-20">
+          <div id="touch-stick" class="w-28 h-28 rounded-full bg-white/10 border border-white/20 pointer-events-auto relative flex items-center justify-center touch-none">
+            <div id="touch-knob" class="w-11 h-11 rounded-full bg-red-500/70 border border-white/40 pointer-events-none"></div>
+          </div>
+          <div class="flex flex-col gap-2 items-end pointer-events-auto">
+            <div class="flex gap-2">
+              <button id="touch-interact" class="w-12 h-12 rounded-full hud-glass text-xs font-mono font-bold text-amber-300 active:scale-95">E</button>
+              <button id="touch-dodge" class="w-12 h-12 rounded-full hud-glass text-[10px] font-mono font-bold text-sky-300 active:scale-95">DASH</button>
+              <button id="touch-reload" class="w-12 h-12 rounded-full hud-glass text-xs font-mono font-bold text-zinc-200 active:scale-95">R</button>
+            </div>
+            <button id="touch-fire" class="w-20 h-20 rounded-full bg-red-600/80 border-2 border-red-300/70 text-xs font-mono font-bold text-white shadow-lg active:scale-95 touch-none">FIRE</button>
+          </div>
         </div>
       </div>
 
@@ -375,8 +396,9 @@ export class HUD {
               <div class="flex justify-between text-xs font-mono text-zinc-200 mb-1"><span>Mouse Sensitivity</span><span id="sens-val">1.00x</span></div>
               <input id="sens-slider" type="range" min="25" max="250" value="100" class="w-full accent-red-600" />
             </label>
-            <div class="grid grid-cols-2 gap-2 pt-1">
+            <div class="grid grid-cols-3 gap-2 pt-1">
               <button id="btn-mute" class="py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-mono text-zinc-200">Mute Audio</button>
+              <button id="btn-voice" class="py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-mono text-sky-300">Voice: ON</button>
               <button id="btn-quality" class="py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-mono text-amber-300">Quality: HIGH</button>
             </div>
           </div>
@@ -463,8 +485,48 @@ export class HUD {
     $('pause-hint').addEventListener('click', () => this.callbacks.onResume());
     $('btn-resume').addEventListener('click', () => this.callbacks.onResume());
     $('btn-mute').addEventListener('click', () => this.callbacks.onToggleMute());
+    $('btn-voice').addEventListener('click', () => this.callbacks.onToggleVoice());
     $('btn-restart').addEventListener('click', () => this.callbacks.onRestart());
     $('btn-restart-pause').addEventListener('click', () => this.callbacks.onRestart());
+
+    // Bind responsive touch controls for dual-input accessibility
+    const stick = $('touch-stick');
+    const knob = $('touch-knob');
+    let stickId: number | null = null;
+    stick.addEventListener('touchstart', (e) => {
+      const t = e.changedTouches[0];
+      if (!t) return;
+      stickId = t.identifier;
+    }, { passive: true });
+    stick.addEventListener('touchmove', (e) => {
+      const t = Array.from(e.changedTouches).find((x) => x.identifier === stickId);
+      if (!t) return;
+      const rect = stick.getBoundingClientRect();
+      const dx = t.clientX - (rect.left + rect.width / 2);
+      const dy = t.clientY - (rect.top + rect.height / 2);
+      const maxR = rect.width * 0.42;
+      const len = Math.hypot(dx, dy);
+      const clamped = Math.min(len, maxR);
+      const nx = len > 0.01 ? (dx / len) * (clamped / maxR) : 0;
+      const ny = len > 0.01 ? (dy / len) * (clamped / maxR) : 0;
+      knob.style.transform = `translate(${nx * maxR}px, ${ny * maxR}px)`;
+      this.callbacks.onTouchMove?.(nx, ny);
+    }, { passive: true });
+    const resetStick = () => {
+      stickId = null;
+      knob.style.transform = 'translate(0px, 0px)';
+      this.callbacks.onTouchMove?.(0, 0);
+    };
+    stick.addEventListener('touchend', resetStick);
+    stick.addEventListener('touchcancel', resetStick);
+
+    const tFire = $('touch-fire');
+    tFire.addEventListener('touchstart', () => this.callbacks.onTouchFire?.(true), { passive: true });
+    tFire.addEventListener('touchend', () => this.callbacks.onTouchFire?.(false));
+    tFire.addEventListener('touchcancel', () => this.callbacks.onTouchFire?.(false));
+    $('touch-interact').addEventListener('touchstart', () => this.callbacks.onTouchAction?.('KeyE'), { passive: true });
+    $('touch-dodge').addEventListener('touchstart', () => this.callbacks.onTouchAction?.('Space'), { passive: true });
+    $('touch-reload').addEventListener('touchstart', () => this.callbacks.onTouchAction?.('KeyR'), { passive: true });
     $('craft-medkit').addEventListener('click', () => this.callbacks.onCraftMedkit());
     $('craft-pistol').addEventListener('click', () => this.callbacks.onCraftAmmo('pistol'));
     $('craft-shells').addEventListener('click', () => this.callbacks.onCraftAmmo('shells'));
@@ -519,7 +581,12 @@ export class HUD {
     const qualBtn = document.getElementById('btn-quality')!;
     qualBtn.dataset.high = String(s.highQuality);
     qualBtn.textContent = s.highQuality ? 'Quality: HIGH' : 'Quality: MEDIUM';
+    this.setVoiceEnabled(s.voiceEnabled);
     this.setMuted(s.muted);
+  }
+
+  public setVoiceEnabled(enabled: boolean): void {
+    document.getElementById('btn-voice')!.textContent = enabled ? 'Voice: ON' : 'Voice: OFF';
   }
 
   public setMuted(muted: boolean): void {
